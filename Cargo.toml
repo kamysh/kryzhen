@@ -3,7 +3,7 @@ members = ["kryzhen", "kryzhen-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -13,8 +13,8 @@ sha2 = "0.10"
 walkdir = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = "0.7"
-postgres-native-tls = "0.5"
-native-tls = "0.2"
+postgres-native-tls = { version = "0.5.3", features = ["runtime"] }
+native-tls = "0.2.18"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tracing = "0.1"
