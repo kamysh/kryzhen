@@ -97,6 +97,7 @@ async fn migrate_end_to_end_applies_in_dependency_order_and_is_idempotent() {
         user: "postgres".into(),
         password: "postgres".into(),
         database: "postgres".into(),
+        sslmode: kryzhen::SslMode::Disable,
         dry_run: false,
     };
 
@@ -143,6 +144,7 @@ async fn applies_mallard_example_contacts_tree() {
         user: "postgres".into(),
         password: "postgres".into(),
         database: "postgres".into(),
+        sslmode: kryzhen::SslMode::Disable,
         dry_run: false,
     };
 
@@ -196,4 +198,78 @@ fn mallard_test_block_is_rejected() {
         matches!(err, kryzhen::Error::Parse { .. }),
         "a #!test block must be a parse error, got: {err:?}"
     );
+}
+
+/// kryzhen connects and applies a migration over a real TLS handshake.
+///
+/// The stock `testcontainers` Postgres image starts with `ssl=off` and offers no helper
+/// to enable it, so this test runs against an externally provided TLS-enabled server
+/// instead of spinning up its own container. It is opt-in: set `KRYZHEN_TLS_DSN_PORT`
+/// to the host port of a PostgreSQL started with `ssl=on` (user `postgres`, password
+/// `postgres`, database `postgres`). When the var is unset the test is skipped.
+///
+/// Bring such a server up with:
+/// ```text
+/// openssl req -new -x509 -days 1 -nodes -subj /CN=localhost -out /tmp/server.crt -keyout /tmp/server.key
+/// docker run -d --name kryzhen-tls -e POSTGRES_PASSWORD=postgres -p 55432:5432 \
+///   -v /tmp/server.crt:/certs/server.crt:ro -v /tmp/server.key:/certs/server.key:ro postgres:17 \
+///   bash -c 'install -o postgres -g postgres -m 0600 /certs/server.key /var/lib/postgresql/server.key && \
+///            install -o postgres -g postgres -m 0644 /certs/server.crt /var/lib/postgresql/server.crt && \
+///            exec docker-entrypoint.sh postgres -c ssl=on \
+///              -c ssl_cert_file=/var/lib/postgresql/server.crt -c ssl_key_file=/var/lib/postgresql/server.key'
+/// KRYZHEN_TLS_DSN_PORT=55432 cargo test -p kryzhen --test applier migrate_over_tls_require
+/// ```
+///
+/// `sslmode=require` fails unless TLS is actually negotiated, so a passing run proves the
+/// native-tls connector path (including `danger_accept_invalid_certs` against the
+/// self-signed cert) end to end.
+#[tokio::test]
+async fn migrate_over_tls_require() {
+    let Ok(port) = std::env::var("KRYZHEN_TLS_DSN_PORT") else {
+        eprintln!("KRYZHEN_TLS_DSN_PORT unset; skipping real-TLS test");
+        return;
+    };
+    let port: u16 = port
+        .parse()
+        .expect("KRYZHEN_TLS_DSN_PORT must be a port number");
+
+    // Sanity-check the server really has TLS on, so a failure points at the fixture, not
+    // at kryzhen.
+    let (probe, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=postgres password=postgres dbname=postgres sslmode=disable"),
+        NoTls,
+    )
+    .await
+    .expect("connect to fixture server");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let server_ssl: String = probe.query_one("SHOW ssl", &[]).await.unwrap().get(0);
+    assert_eq!(server_ssl, "on", "fixture server must have ssl=on");
+
+    let dir = std::env::temp_dir().join(format!("kryzhen-tls-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("a.sql"),
+        "-- #!migration\n-- name: \"a\",\n-- description: \"a\";\nCREATE TABLE tls_t (id int);\n",
+    )
+    .unwrap();
+
+    let config = Config {
+        root: dir.clone(),
+        host: "127.0.0.1".into(),
+        port,
+        user: "postgres".into(),
+        password: "postgres".into(),
+        database: "postgres".into(),
+        sslmode: kryzhen::SslMode::Require,
+        dry_run: false,
+    };
+
+    let report = migrate(config)
+        .await
+        .expect("migrate over sslmode=require should succeed");
+    assert_eq!(report.applied, vec!["a".to_string()]);
+
+    std::fs::remove_dir_all(&dir).ok();
 }

@@ -49,6 +49,8 @@ pub enum Error {
     CorruptChecksum { name: MigrationName, len: usize },
     #[error("database error: {0}")]
     Db(#[from] tokio_postgres::Error),
+    #[error("TLS error: {0}")]
+    Tls(#[from] native_tls::Error),
 }
 
 /// Compute the kryzhen/mallard checksum of a migration body:

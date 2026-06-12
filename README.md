@@ -82,7 +82,7 @@ Each migration runs inside its own transaction together with its bookkeeping `IN
 ## Library usage
 
 ```rust
-use kryzhen::{migrate, Config};
+use kryzhen::{migrate, Config, SslMode};
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -94,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
         user: "postgres".into(),
         password: "secret".into(),
         database: "mydb".into(),
+        sslmode: SslMode::Prefer,
         dry_run: false,
     })
     .await?;
@@ -114,6 +115,7 @@ async fn main() -> anyhow::Result<()> {
 | `user` | `String` | Database user. |
 | `password` | `String` | Database password. |
 | `database` | `String` | Database name. |
+| `sslmode` | `SslMode` | TLS negotiation: `Disable`, `Prefer` (default), or `Require`. See [TLS](#tls). |
 | `dry_run` | `bool` | If `true`, resolve and plan but apply nothing. Still connects to the database to load applied migrations and verify checksums. |
 
 ### `Report` fields
@@ -142,6 +144,7 @@ kryzhen --database mydb [ROOT]
 | `--port <PORT>` | `5432` | Server port. |
 | `--user <USER>` | `postgres` | Username. |
 | `--password <PASSWORD>` | *(empty)* | Password. |
+| `--sslmode <MODE>` | `prefer` | TLS mode: `disable`, `prefer`, or `require`. See [TLS](#tls). |
 | `--dry-run` | off | Print the planned migration order; apply nothing. |
 | `-v, --verbose` | off | Enable debug-level logging. |
 | `-h, --help` | | Print help. |
@@ -154,6 +157,22 @@ kryzhen --database mydb --dry-run migrations/
 ```
 
 Prints the migrations that would be applied, in topological order, without modifying the database. (It still connects, to load the applied set and verify checksums.)
+
+---
+
+## TLS
+
+kryzhen negotiates TLS using the standard libpq `sslmode` values (a subset):
+
+| Mode | Behaviour |
+|---|---|
+| `disable` | Never use TLS; connect in plaintext. |
+| `prefer` *(default)* | Use TLS if the server offers it; otherwise fall back to plaintext. |
+| `require` | Require TLS; fail if the server does not offer it. |
+
+In `prefer` and `require` the connection is **encrypted but the server certificate is not verified** against a CA — the same trust level libpq gives these modes. This is what lets kryzhen connect to a database using a self-signed or private-CA certificate (common for internal/isolated PostgreSQL). Certificate verification (`verify-ca`/`verify-full`) is not yet supported.
+
+TLS uses OpenSSL (via `native-tls`), so the build needs OpenSSL and `pkg-config` available — see [docs/development.md](docs/development.md).
 
 ---
 

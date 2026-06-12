@@ -1,5 +1,5 @@
 use clap::Parser;
-use kryzhen::{migrate, Config};
+use kryzhen::{migrate, Config, SslMode};
 use std::path::PathBuf;
 
 /// Forward-only, dependency-resolved SQL migrations for PostgreSQL (mallard-compatible).
@@ -30,6 +30,11 @@ struct Args {
     #[arg(long, default_value = "")]
     password: String,
 
+    /// TLS negotiation: disable, prefer, or require (libpq semantics; prefer and
+    /// require encrypt without verifying the server certificate).
+    #[arg(long, default_value = "prefer", value_parser = parse_sslmode)]
+    sslmode: SslMode,
+
     /// Print the planned migration order; apply nothing.
     #[arg(long)]
     dry_run: bool,
@@ -37,6 +42,11 @@ struct Args {
     /// Verbose logging.
     #[arg(short, long)]
     verbose: bool,
+}
+
+/// clap value parser for `--sslmode`, delegating to [`SslMode`]'s `FromStr`.
+fn parse_sslmode(s: &str) -> Result<SslMode, String> {
+    s.parse()
 }
 
 #[tokio::main]
@@ -57,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
         user: args.user,
         password: args.password,
         database: args.database,
+        sslmode: args.sslmode,
         dry_run: args.dry_run,
     };
 

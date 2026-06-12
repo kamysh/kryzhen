@@ -43,6 +43,7 @@
 //!     user: "postgres".into(),
 //!     password: "secret".into(),
 //!     database: "mydb".into(),
+//!     sslmode: kryzhen::SslMode::Prefer,
 //!     dry_run: false,
 //! })
 //! .await?;
@@ -80,14 +81,67 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::str::FromStr;
+
+/// How kryzhen negotiates TLS when connecting to PostgreSQL.
+///
+/// The semantics mirror libpq's `sslmode` (the subset kryzhen supports). In
+/// [`Prefer`](SslMode::Prefer) and [`Require`](SslMode::Require) the server
+/// certificate is **not** verified against a CA (encryption without
+/// authentication) — matching libpq's behaviour for those modes. Certificate
+/// verification (`verify-ca`/`verify-full`) is not yet supported.
+///
+/// ```
+/// use kryzhen::SslMode;
+/// assert_eq!(SslMode::default(), SslMode::Prefer);
+/// assert_eq!("require".parse::<SslMode>().unwrap(), SslMode::Require);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SslMode {
+    /// Never use TLS; connect in plaintext only.
+    Disable,
+    /// Try TLS first, fall back to plaintext if the server does not offer it.
+    /// This is the default, matching libpq.
+    #[default]
+    Prefer,
+    /// Require TLS; fail if the server does not offer it.
+    Require,
+}
+
+impl std::fmt::Display for SslMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            SslMode::Disable => "disable",
+            SslMode::Prefer => "prefer",
+            SslMode::Require => "require",
+        };
+        f.write_str(s)
+    }
+}
+
+impl FromStr for SslMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "disable" => Ok(SslMode::Disable),
+            "prefer" => Ok(SslMode::Prefer),
+            "require" => Ok(SslMode::Require),
+            other => Err(format!(
+                "invalid sslmode {other:?} (expected disable, prefer, or require)"
+            )),
+        }
+    }
+}
 
 /// Connection and run configuration for [`migrate`].
 ///
 /// The connection string is built from the individual `host`/`port`/`user`/
-/// `password`/`database` fields (kryzhen connects with `NoTls`).
+/// `password`/`database` fields; TLS negotiation is controlled by
+/// [`sslmode`](Config::sslmode).
 ///
 /// ```
-/// use kryzhen::Config;
+/// use kryzhen::{Config, SslMode};
 /// use std::path::PathBuf;
 ///
 /// let config = Config {
@@ -97,6 +151,7 @@ use std::path::PathBuf;
 ///     user: "postgres".into(),
 ///     password: String::new(),
 ///     database: "mydb".into(),
+///     sslmode: SslMode::Prefer,
 ///     dry_run: true,
 /// };
 /// assert!(config.dry_run);
@@ -115,6 +170,8 @@ pub struct Config {
     pub password: String,
     /// Database name to connect to.
     pub database: String,
+    /// TLS negotiation mode (see [`SslMode`]).
+    pub sslmode: SslMode,
     /// If `true`, resolve and plan the migrations but apply nothing. kryzhen still
     /// connects to the database to load the applied set and verify checksums.
     pub dry_run: bool,
@@ -152,20 +209,11 @@ pub struct Report {
 /// ([`Error::Db`]). A migration whose SQL fails rolls back and aborts the run;
 /// migrations committed earlier in the run remain applied (forward-only).
 pub async fn migrate(config: Config) -> Result<Report> {
-    use tokio_postgres::NoTls;
-
     let migrations = file::load_dir(&config.root)?;
     validation::check_duplicate_names(&migrations)?;
     let ordered = graph::topo_sort(migrations)?;
 
-    let conn_str = format!(
-        "host={} port={} user={} password={} dbname={}",
-        config.host, config.port, config.user, config.password, config.database
-    );
-    let (mut client, connection) = tokio_postgres::connect(&conn_str, NoTls).await?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
+    let mut client = connect_db(&config).await?;
 
     postgres::ensure_schema(&client).await?;
     let applied: HashMap<MigrationName, [u8; 32]> = postgres::load_applied(&client).await?;
@@ -183,4 +231,43 @@ pub async fn migrate(config: Config) -> Result<Report> {
         report.applied.push(m.name.0.clone());
     }
     Ok(report)
+}
+
+/// Connect to PostgreSQL per `config`, spawning the connection task and returning
+/// the live client. `sslmode` is passed through the connection string so
+/// tokio-postgres drives negotiation (including `prefer`'s plaintext fallback);
+/// `disable` uses [`NoTls`], while the TLS modes use a native-tls connector that
+/// encrypts without verifying the server certificate (matching libpq's
+/// `prefer`/`require` semantics — `verify-ca`/`verify-full` are not yet supported).
+async fn connect_db(config: &Config) -> Result<tokio_postgres::Client> {
+    use tokio_postgres::NoTls;
+
+    let conn_str = format!(
+        "host={} port={} user={} password={} dbname={} sslmode={}",
+        config.host, config.port, config.user, config.password, config.database, config.sslmode
+    );
+
+    // The two connectors yield different `Connection` types, so each arm spawns its
+    // own connection-driver task and returns just the `Client`.
+    match config.sslmode {
+        SslMode::Disable => {
+            let (client, conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            Ok(client)
+        }
+        SslMode::Prefer | SslMode::Require => {
+            let connector = native_tls::TlsConnector::builder()
+                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_hostnames(true)
+                .build()?;
+            let tls = postgres_native_tls::MakeTlsConnector::new(connector);
+            let (client, conn) = tokio_postgres::connect(&conn_str, tls).await?;
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            Ok(client)
+        }
+    }
 }

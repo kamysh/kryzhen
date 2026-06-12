@@ -21,28 +21,44 @@
           extensions = [ "rust-src" "clippy" "rustfmt" ];
         };
 
-        # All kryzhen runtime/dev dependencies (tokio-postgres with NoTls, sha2,
-        # walkdir, clap, tracing, and the testcontainers dev-deps) are pure Rust, so
-        # the build needs only the toolchain and a linker. The integration tests
-        # require an external Docker daemon for testcontainers.
-        kryzhen = pkgs.rustPlatform.buildRustPackage {
+        # kryzhen's TLS support uses native-tls (OpenSSL) for the `prefer`/`require`
+        # sslmode. native-tls links OpenSSL via openssl-sys, so the build needs
+        # pkg-config plus the OpenSSL library. The integration tests require an
+        # external Docker daemon for testcontainers.
+        commonAttrs = {
           pname = "kryzhen";
-          version = "0.1.0";
+          version = "0.2.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.openssl ];
           # The integration tests under kryzhen/tests/applier.rs need Docker, which is
           # not available in the Nix sandbox; run them via `cargo test` in the devShell.
           doCheck = false;
         };
+
+        kryzhen = pkgs.rustPlatform.buildRustPackage commonAttrs;
+
+        # Fully static binary via musl (pkgsStatic). pkgsStatic provides a static
+        # OpenSSL so native-tls links cleanly into the musl binary. Build with
+        # `nix build .#kryzhen-static`; the result lands in ./result/bin/.
+        kryzhen-static = pkgs.pkgsStatic.rustPlatform.buildRustPackage (commonAttrs // {
+          nativeBuildInputs = [ pkgs.pkgsStatic.pkg-config ];
+          buildInputs = [ pkgs.pkgsStatic.openssl ];
+        });
       in
       {
         packages = {
           default = kryzhen;
           kryzhen = kryzhen;
+          kryzhen-static = kryzhen-static;
         };
 
         devShells.default = pkgs.mkShell {
           name = "kryzhen-dev";
+
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.openssl ];
 
           packages = [
             rustToolchain

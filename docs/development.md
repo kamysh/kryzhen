@@ -6,9 +6,10 @@ How to build, test, and contribute to kryzhen.
 
 - A stable **Rust toolchain** (edition 2021), e.g. via [rustup](https://rustup.rs/) or
   your system package manager. kryzhen is a standard Cargo project — `cargo build`,
-  `cargo test`, etc. work as usual. The crates depend only on pure-Rust libraries
-  (`tokio-postgres` with `NoTls`, `sha2`, `walkdir`, `clap`, `tracing`), so no system C
-  libraries are needed.
+  `cargo test`, etc. work as usual.
+- **OpenSSL** and **`pkg-config`** — TLS support uses `native-tls`, which links OpenSSL
+  via `openssl-sys`. On Debian/Ubuntu: `apt install libssl-dev pkg-config`; on macOS:
+  `brew install openssl pkg-config`. (The Nix dev shell below provides both.)
 - [Docker](https://www.docker.com/) — required only to run the integration tests, which
   spin up a throwaway PostgreSQL container via
   [testcontainers](https://docs.rs/testcontainers).
@@ -55,6 +56,29 @@ The integration tests include a run against mallard's own `example-contacts` mig
 tree (vendored verbatim under `kryzhen/tests/fixtures/mallard-example-contacts/`),
 which exercises real-world dependency resolution, the multiple-blocks-per-file path,
 and `#!test` rejection.
+
+### Optional: real-TLS test
+
+`migrate_over_tls_require` verifies a `sslmode=require` connection over an actual TLS
+handshake. The stock testcontainers PostgreSQL image ships with `ssl=off` and offers no
+helper to enable it, so this test is opt-in: it runs only when `KRYZHEN_TLS_DSN_PORT`
+points at an externally started TLS-enabled server (otherwise it is skipped). To run it:
+
+```bash
+openssl req -new -x509 -days 1 -nodes -subj /CN=localhost \
+  -out /tmp/server.crt -keyout /tmp/server.key
+chmod 0600 /tmp/server.key
+docker run -d --name kryzhen-tls -e POSTGRES_PASSWORD=postgres -p 55432:5432 \
+  -v /tmp/server.crt:/certs/server.crt:ro -v /tmp/server.key:/certs/server.key:ro postgres:17 \
+  bash -c 'install -o postgres -g postgres -m 0600 /certs/server.key /var/lib/postgresql/server.key && \
+           install -o postgres -g postgres -m 0644 /certs/server.crt /var/lib/postgresql/server.crt && \
+           exec docker-entrypoint.sh postgres -c ssl=on \
+             -c ssl_cert_file=/var/lib/postgresql/server.crt \
+             -c ssl_key_file=/var/lib/postgresql/server.key'
+
+KRYZHEN_TLS_DSN_PORT=55432 cargo test -p kryzhen --test applier migrate_over_tls_require
+docker rm -f kryzhen-tls
+```
 
 ## Lint and format
 
