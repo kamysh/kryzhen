@@ -44,6 +44,9 @@
 //!     password: "secret".into(),
 //!     database: "mydb".into(),
 //!     sslmode: kryzhen::SslMode::Prefer,
+//!     ssl_root_cert: None,
+//!     ssl_client_cert: None,
+//!     ssl_client_key: None,
 //!     dry_run: false,
 //! })
 //! .await?;
@@ -85,16 +88,16 @@ use std::str::FromStr;
 
 /// How kryzhen negotiates TLS when connecting to PostgreSQL.
 ///
-/// The semantics mirror libpq's `sslmode` (the subset kryzhen supports). In
-/// [`Prefer`](SslMode::Prefer) and [`Require`](SslMode::Require) the server
-/// certificate is **not** verified against a CA (encryption without
-/// authentication) — matching libpq's behaviour for those modes. Certificate
-/// verification (`verify-ca`/`verify-full`) is not yet supported.
+/// The semantics mirror libpq's `sslmode`. In [`Prefer`](SslMode::Prefer) and
+/// [`Require`](SslMode::Require) the server certificate is **not** verified
+/// against a CA (encryption without authentication). [`VerifyCa`] and
+/// [`VerifyFull`] require `ssl_root_cert` to be set in [`Config`].
 ///
 /// ```
 /// use kryzhen::SslMode;
 /// assert_eq!(SslMode::default(), SslMode::Prefer);
 /// assert_eq!("require".parse::<SslMode>().unwrap(), SslMode::Require);
+/// assert_eq!("verify-full".parse::<SslMode>().unwrap(), SslMode::VerifyFull);
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SslMode {
@@ -104,8 +107,12 @@ pub enum SslMode {
     /// This is the default, matching libpq.
     #[default]
     Prefer,
-    /// Require TLS; fail if the server does not offer it.
+    /// Require TLS; fail if the server does not offer it. Certificate is not verified.
     Require,
+    /// Require TLS and verify the server certificate against `ssl_root_cert`.
+    VerifyCa,
+    /// Like `verify-ca`, and also verify the server hostname matches the certificate.
+    VerifyFull,
 }
 
 impl std::fmt::Display for SslMode {
@@ -114,6 +121,8 @@ impl std::fmt::Display for SslMode {
             SslMode::Disable => "disable",
             SslMode::Prefer => "prefer",
             SslMode::Require => "require",
+            SslMode::VerifyCa => "verify-ca",
+            SslMode::VerifyFull => "verify-full",
         };
         f.write_str(s)
     }
@@ -127,8 +136,10 @@ impl FromStr for SslMode {
             "disable" => Ok(SslMode::Disable),
             "prefer" => Ok(SslMode::Prefer),
             "require" => Ok(SslMode::Require),
+            "verify-ca" => Ok(SslMode::VerifyCa),
+            "verify-full" => Ok(SslMode::VerifyFull),
             other => Err(format!(
-                "invalid sslmode {other:?} (expected disable, prefer, or require)"
+                "invalid sslmode {other:?} (expected disable, prefer, require, verify-ca, or verify-full)"
             )),
         }
     }
@@ -152,6 +163,9 @@ impl FromStr for SslMode {
 ///     password: String::new(),
 ///     database: "mydb".into(),
 ///     sslmode: SslMode::Prefer,
+///     ssl_root_cert: None,
+///     ssl_client_cert: None,
+///     ssl_client_key: None,
 ///     dry_run: true,
 /// };
 /// assert!(config.dry_run);
@@ -172,9 +186,132 @@ pub struct Config {
     pub database: String,
     /// TLS negotiation mode (see [`SslMode`]).
     pub sslmode: SslMode,
+    /// CA certificate for `verify-ca` / `verify-full` (PEM file path).
+    pub ssl_root_cert: Option<std::path::PathBuf>,
+    /// Client certificate for mutual TLS (PEM file path).
+    pub ssl_client_cert: Option<std::path::PathBuf>,
+    /// Client private key for mutual TLS (PEM file path).
+    pub ssl_client_key: Option<std::path::PathBuf>,
     /// If `true`, resolve and plan the migrations but apply nothing. kryzhen still
     /// connects to the database to load the applied set and verify checksums.
     pub dry_run: bool,
+}
+
+impl Config {
+    /// Start building a [`Config`] with the required connection fields.
+    ///
+    /// ```
+    /// use kryzhen::Config;
+    /// use std::path::PathBuf;
+    ///
+    /// let config = Config::builder(
+    ///     PathBuf::from("migrations"),
+    ///     "127.0.0.1",
+    ///     5432,
+    ///     "postgres",
+    ///     "",
+    ///     "mydb",
+    /// )
+    /// .build();
+    /// ```
+    pub fn builder(
+        root: impl Into<PathBuf>,
+        host: impl Into<String>,
+        port: u16,
+        user: impl Into<String>,
+        password: impl Into<String>,
+        database: impl Into<String>,
+    ) -> ConfigBuilder {
+        ConfigBuilder {
+            root: root.into(),
+            host: host.into(),
+            port,
+            user: user.into(),
+            password: password.into(),
+            database: database.into(),
+            sslmode: SslMode::default(),
+            ssl_root_cert: None,
+            ssl_client_cert: None,
+            ssl_client_key: None,
+            dry_run: false,
+        }
+    }
+}
+
+/// Builder for [`Config`]. Obtain one via [`Config::builder`].
+///
+/// ```
+/// use kryzhen::{Config, SslMode};
+/// use std::path::PathBuf;
+///
+/// let config = Config::builder(PathBuf::from("migrations"), "127.0.0.1", 5432, "postgres", "", "mydb")
+///     .sslmode(SslMode::Require)
+///     .dry_run(true)
+///     .build();
+/// assert!(config.dry_run);
+/// ```
+#[derive(Clone, Debug)]
+pub struct ConfigBuilder {
+    root: PathBuf,
+    host: String,
+    port: u16,
+    user: String,
+    password: String,
+    database: String,
+    sslmode: SslMode,
+    ssl_root_cert: Option<PathBuf>,
+    ssl_client_cert: Option<PathBuf>,
+    ssl_client_key: Option<PathBuf>,
+    dry_run: bool,
+}
+
+impl ConfigBuilder {
+    /// Set the TLS negotiation mode (default: `Prefer`).
+    pub fn sslmode(mut self, mode: SslMode) -> Self {
+        self.sslmode = mode;
+        self
+    }
+
+    /// CA certificate for `verify-ca` / `verify-full` (PEM file path).
+    pub fn ssl_root_cert(mut self, path: impl Into<PathBuf>) -> Self {
+        self.ssl_root_cert = Some(path.into());
+        self
+    }
+
+    /// Client certificate for mutual TLS (PEM file path).
+    pub fn ssl_client_cert(mut self, path: impl Into<PathBuf>) -> Self {
+        self.ssl_client_cert = Some(path.into());
+        self
+    }
+
+    /// Client private key for mutual TLS (PEM file path).
+    pub fn ssl_client_key(mut self, path: impl Into<PathBuf>) -> Self {
+        self.ssl_client_key = Some(path.into());
+        self
+    }
+
+    /// If `true`, resolve and plan the migrations but apply nothing.
+    pub fn dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
+    }
+
+    /// Consume the builder and produce a [`Config`].
+    pub fn build(self) -> Config {
+        Config {
+            root: self.root,
+            host: self.host,
+            port: self.port,
+            user: self.user,
+            password: self.password,
+            database: self.database,
+            sslmode: self.sslmode,
+            ssl_root_cert: self.ssl_root_cert,
+            ssl_client_cert: self.ssl_client_cert,
+            ssl_client_key: self.ssl_client_key,
+            dry_run: self.dry_run,
+        }
+    }
 }
 
 /// Summary of a [`migrate`] run.
@@ -234,40 +371,63 @@ pub async fn migrate(config: Config) -> Result<Report> {
 }
 
 /// Connect to PostgreSQL per `config`, spawning the connection task and returning
-/// the live client. `sslmode` is passed through the connection string so
-/// tokio-postgres drives negotiation (including `prefer`'s plaintext fallback);
-/// `disable` uses [`NoTls`], while the TLS modes use a native-tls connector that
-/// encrypts without verifying the server certificate (matching libpq's
-/// `prefer`/`require` semantics — `verify-ca`/`verify-full` are not yet supported).
+/// the live client.
+///
+/// tokio-postgres handles `SslMode::Prefer` natively: it sends an SSLRequest and
+/// falls back to plaintext if the server declines. This requires passing the TLS
+/// connector directly to `cfg.connect()` — a connection-string-based approach
+/// commits the connector type before the SSLRequest exchange runs, breaking
+/// `Prefer` fallback.
 async fn connect_db(config: &Config) -> Result<tokio_postgres::Client> {
-    use tokio_postgres::NoTls;
+    let mut pg_cfg = tokio_postgres::Config::new();
+    pg_cfg.host(&config.host);
+    pg_cfg.port(config.port);
+    pg_cfg.dbname(&config.database);
+    pg_cfg.user(&config.user);
+    pg_cfg.password(&config.password);
 
-    let conn_str = format!(
-        "host={} port={} user={} password={} dbname={} sslmode={}",
-        config.host, config.port, config.user, config.password, config.database, config.sslmode
-    );
-
-    // The two connectors yield different `Connection` types, so each arm spawns its
-    // own connection-driver task and returns just the `Client`.
-    match config.sslmode {
-        SslMode::Disable => {
-            let (client, conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
-            tokio::spawn(async move {
-                let _ = conn.await;
-            });
-            Ok(client)
+    pg_cfg.ssl_mode(match config.sslmode {
+        SslMode::Disable => tokio_postgres::config::SslMode::Disable,
+        SslMode::Prefer => tokio_postgres::config::SslMode::Prefer,
+        SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => {
+            tokio_postgres::config::SslMode::Require
         }
-        SslMode::Prefer | SslMode::Require => {
-            let connector = native_tls::TlsConnector::builder()
-                .danger_accept_invalid_certs(true)
-                .danger_accept_invalid_hostnames(true)
-                .build()?;
-            let tls = postgres_native_tls::MakeTlsConnector::new(connector);
-            let (client, conn) = tokio_postgres::connect(&conn_str, tls).await?;
-            tokio::spawn(async move {
-                let _ = conn.await;
-            });
-            Ok(client)
+    });
+
+    if config.sslmode == SslMode::Disable {
+        let (client, conn) = pg_cfg.connect(tokio_postgres::NoTls).await?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        return Ok(client);
+    }
+
+    let mut tls_builder = native_tls::TlsConnector::builder();
+    match config.sslmode {
+        SslMode::Require | SslMode::Prefer => {
+            tls_builder.danger_accept_invalid_certs(true);
+        }
+        SslMode::VerifyCa | SslMode::VerifyFull => {
+            if let Some(ref path) = config.ssl_root_cert {
+                let pem = std::fs::read(path)?;
+                let cert = native_tls::Certificate::from_pem(&pem)?;
+                tls_builder.add_root_certificate(cert);
+            }
+        }
+        SslMode::Disable => {}
+    }
+    if let Some(ref cert_path) = config.ssl_client_cert {
+        if let Some(ref key_path) = config.ssl_client_key {
+            let cert_pem = std::fs::read(cert_path)?;
+            let key_pem = std::fs::read(key_path)?;
+            let identity = native_tls::Identity::from_pkcs8(&cert_pem, &key_pem)?;
+            tls_builder.identity(identity);
         }
     }
+    let tls = postgres_native_tls::MakeTlsConnector::new(tls_builder.build()?);
+    let (client, conn) = pg_cfg.connect(tls).await?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    Ok(client)
 }

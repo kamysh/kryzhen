@@ -98,6 +98,9 @@ async fn migrate_end_to_end_applies_in_dependency_order_and_is_idempotent() {
         password: "postgres".into(),
         database: "postgres".into(),
         sslmode: kryzhen::SslMode::Disable,
+        ssl_root_cert: None,
+        ssl_client_cert: None,
+        ssl_client_key: None,
         dry_run: false,
     };
 
@@ -145,6 +148,9 @@ async fn applies_mallard_example_contacts_tree() {
         password: "postgres".into(),
         database: "postgres".into(),
         sslmode: kryzhen::SslMode::Disable,
+        ssl_root_cert: None,
+        ssl_client_cert: None,
+        ssl_client_key: None,
         dry_run: false,
     };
 
@@ -247,6 +253,9 @@ async fn migrate_over_tls_require() {
     let server_ssl: String = probe.query_one("SHOW ssl", &[]).await.unwrap().get(0);
     assert_eq!(server_ssl, "on", "fixture server must have ssl=on");
 
+    // Clean up any state left by a previous run so the test is idempotent.
+    probe.batch_execute("DROP TABLE IF EXISTS tls_t; DROP SCHEMA IF EXISTS mallard CASCADE;").await.unwrap();
+
     let dir = std::env::temp_dir().join(format!("kryzhen-tls-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -263,6 +272,9 @@ async fn migrate_over_tls_require() {
         password: "postgres".into(),
         database: "postgres".into(),
         sslmode: kryzhen::SslMode::Require,
+        ssl_root_cert: None,
+        ssl_client_cert: None,
+        ssl_client_key: None,
         dry_run: false,
     };
 

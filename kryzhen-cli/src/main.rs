@@ -30,10 +30,21 @@ struct Args {
     #[arg(long, default_value = "")]
     password: String,
 
-    /// TLS negotiation: disable, prefer, or require (libpq semantics; prefer and
-    /// require encrypt without verifying the server certificate).
+    /// TLS negotiation: disable, prefer, require, verify-ca, or verify-full.
     #[arg(long, default_value = "prefer", value_parser = parse_sslmode)]
     sslmode: SslMode,
+
+    /// CA certificate for verify-ca / verify-full (PEM file path).
+    #[arg(long)]
+    ssl_root_cert: Option<std::path::PathBuf>,
+
+    /// Client certificate for mutual TLS (PEM file path).
+    #[arg(long)]
+    ssl_client_cert: Option<std::path::PathBuf>,
+
+    /// Client private key for mutual TLS (PEM file path).
+    #[arg(long)]
+    ssl_client_key: Option<std::path::PathBuf>,
 
     /// Print the planned migration order; apply nothing.
     #[arg(long)]
@@ -68,6 +79,9 @@ async fn main() -> anyhow::Result<()> {
         password: args.password,
         database: args.database,
         sslmode: args.sslmode,
+        ssl_root_cert: args.ssl_root_cert,
+        ssl_client_cert: args.ssl_client_cert,
+        ssl_client_key: args.ssl_client_key,
         dry_run: args.dry_run,
     };
 

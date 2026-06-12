@@ -81,22 +81,19 @@ Each migration runs inside its own transaction together with its bookkeeping `IN
 
 ## Library usage
 
+The preferred way to construct a `Config` is through the builder:
+
 ```rust
 use kryzhen::{migrate, Config, SslMode};
 use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let report = kryzhen::migrate(Config {
-        root: PathBuf::from("migrations"),
-        host: "127.0.0.1".into(),
-        port: 5432,
-        user: "postgres".into(),
-        password: "secret".into(),
-        database: "mydb".into(),
-        sslmode: SslMode::Prefer,
-        dry_run: false,
-    })
+    let report = migrate(
+        Config::builder(PathBuf::from("migrations"), "127.0.0.1", 5432, "postgres", "secret", "mydb")
+            .sslmode(SslMode::Require)
+            .build(),
+    )
     .await?;
 
     println!("Applied:         {:?}", report.applied);
@@ -105,18 +102,35 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+Struct literal construction is also supported for all fields.
+
 ### `Config` fields
 
-| Field | Type | Description |
-|---|---|---|
-| `root` | `PathBuf` | Root directory of the migration tree. |
-| `host` | `String` | PostgreSQL host. |
-| `port` | `u16` | PostgreSQL port. |
-| `user` | `String` | Database user. |
-| `password` | `String` | Database password. |
-| `database` | `String` | Database name. |
-| `sslmode` | `SslMode` | TLS negotiation: `Disable`, `Prefer` (default), or `Require`. See [TLS](#tls). |
-| `dry_run` | `bool` | If `true`, resolve and plan but apply nothing. Still connects to the database to load applied migrations and verify checksums. |
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `root` | `PathBuf` | *(required)* | Root directory of the migration tree. |
+| `host` | `String` | *(required)* | PostgreSQL host. |
+| `port` | `u16` | *(required)* | PostgreSQL port. |
+| `user` | `String` | *(required)* | Database user. |
+| `password` | `String` | *(required)* | Database password (may be empty). |
+| `database` | `String` | *(required)* | Database name. |
+| `sslmode` | `SslMode` | `Prefer` | TLS negotiation mode. See [TLS](#tls). |
+| `ssl_root_cert` | `Option<PathBuf>` | `None` | CA certificate for `verify-ca` / `verify-full` (PEM). |
+| `ssl_client_cert` | `Option<PathBuf>` | `None` | Client certificate for mutual TLS (PEM). |
+| `ssl_client_key` | `Option<PathBuf>` | `None` | Client private key for mutual TLS (PEM). |
+| `dry_run` | `bool` | `false` | If `true`, resolve and plan but apply nothing. Still connects to load applied migrations and verify checksums. |
+
+### `ConfigBuilder` methods
+
+| Method | Description |
+|---|---|
+| `Config::builder(root, host, port, user, password, database)` | Create a builder with required fields. |
+| `.sslmode(SslMode)` | Set the TLS negotiation mode (default: `Prefer`). |
+| `.ssl_root_cert(path)` | Set the CA certificate path for `verify-ca` / `verify-full`. |
+| `.ssl_client_cert(path)` | Set the client certificate path for mutual TLS. |
+| `.ssl_client_key(path)` | Set the client private key path for mutual TLS. |
+| `.dry_run(bool)` | Enable or disable dry-run mode. |
+| `.build()` | Consume the builder and return a `Config`. |
 
 ### `Report` fields
 
@@ -144,7 +158,10 @@ kryzhen --database mydb [ROOT]
 | `--port <PORT>` | `5432` | Server port. |
 | `--user <USER>` | `postgres` | Username. |
 | `--password <PASSWORD>` | *(empty)* | Password. |
-| `--sslmode <MODE>` | `prefer` | TLS mode: `disable`, `prefer`, or `require`. See [TLS](#tls). |
+| `--sslmode <MODE>` | `prefer` | TLS mode: `disable`, `prefer`, `require`, `verify-ca`, or `verify-full`. See [TLS](#tls). |
+| `--ssl-root-cert <PATH>` | *(none)* | CA certificate for `verify-ca` / `verify-full` (PEM). |
+| `--ssl-client-cert <PATH>` | *(none)* | Client certificate for mutual TLS (PEM). |
+| `--ssl-client-key <PATH>` | *(none)* | Client private key for mutual TLS (PEM). |
 | `--dry-run` | off | Print the planned migration order; apply nothing. |
 | `-v, --verbose` | off | Enable debug-level logging. |
 | `-h, --help` | | Print help. |
@@ -162,15 +179,23 @@ Prints the migrations that would be applied, in topological order, without modif
 
 ## TLS
 
-kryzhen negotiates TLS using the standard libpq `sslmode` values (a subset):
+kryzhen negotiates TLS using the standard libpq `sslmode` values:
 
 | Mode | Behaviour |
 |---|---|
 | `disable` | Never use TLS; connect in plaintext. |
-| `prefer` *(default)* | Use TLS if the server offers it; otherwise fall back to plaintext. |
-| `require` | Require TLS; fail if the server does not offer it. |
+| `prefer` *(default)* | Use TLS if the server offers it; fall back to plaintext otherwise. |
+| `require` | Require TLS; fail if the server does not offer it. Certificate not verified. |
+| `verify-ca` | Require TLS and verify the server certificate against `ssl_root_cert`. |
+| `verify-full` | Like `verify-ca`, and also verify the server hostname matches the certificate CN/SAN. |
 
-In `prefer` and `require` the connection is **encrypted but the server certificate is not verified** against a CA — the same trust level libpq gives these modes. This is what lets kryzhen connect to a database using a self-signed or private-CA certificate (common for internal/isolated PostgreSQL). Certificate verification (`verify-ca`/`verify-full`) is not yet supported.
+In `prefer` and `require` the connection is **encrypted but the server certificate is not verified** — matching libpq's behaviour for those modes. This lets kryzhen connect to a database using a self-signed or private-CA certificate (common for internal PostgreSQL deployments).
+
+For `verify-ca` and `verify-full`, set `ssl_root_cert` (library) or `--ssl-root-cert` (CLI) to the CA certificate PEM file.
+
+### Mutual TLS
+
+To present a client certificate to the server (for PostgreSQL `clientcert=verify-full` authentication), set both `ssl_client_cert` and `ssl_client_key` (library) or `--ssl-client-cert` and `--ssl-client-key` (CLI). Mutual TLS can be combined with any sslmode that establishes a TLS connection (`prefer`, `require`, `verify-ca`, `verify-full`).
 
 TLS uses OpenSSL (via `native-tls`), so the build needs OpenSSL and `pkg-config` available — see [docs/development.md](docs/development.md).
 
