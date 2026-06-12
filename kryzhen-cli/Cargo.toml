@@ -1,0 +1,17 @@
+[package]
+name = "kryzhen-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kryzhen"
+path = "src/main.rs"
+
+[dependencies]
+kryzhen = { path = "../kryzhen" }
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
