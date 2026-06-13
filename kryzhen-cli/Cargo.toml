@@ -12,6 +12,10 @@ path = "src/main.rs"
 kryzhen = { path = "../kryzhen" }
 clap.workspace = true
 tokio.workspace = true
+tokio-postgres.workspace = true
+postgres-native-tls.workspace = true
+native-tls.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+serde_json.workspace = true

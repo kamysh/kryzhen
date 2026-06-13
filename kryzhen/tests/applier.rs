@@ -1,6 +1,6 @@
+use kryzhen::migrate;
 use kryzhen::postgres::{apply_one, ensure_schema, load_applied};
 use kryzhen::types::{checksum, Migration, MigrationName};
-use kryzhen::{migrate, Config};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
@@ -74,8 +74,7 @@ async fn apply_two_migrations_both_recorded() {
 
 #[tokio::test]
 async fn migrate_end_to_end_applies_in_dependency_order_and_is_idempotent() {
-    let (_client, node) = connect().await;
-    let port = node.get_host_port_ipv4(5432).await.unwrap();
+    let (mut client, _node) = connect().await;
 
     let dir = std::env::temp_dir().join(format!("kryzhen-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -90,24 +89,11 @@ async fn migrate_end_to_end_applies_in_dependency_order_and_is_idempotent() {
     )
     .unwrap();
 
-    let config = Config {
-        root: dir.clone(),
-        host: "127.0.0.1".into(),
-        port,
-        user: "postgres".into(),
-        password: "postgres".into(),
-        database: "postgres".into(),
-        sslmode: kryzhen::SslMode::Disable,
-        ssl_root_cert: None,
-        ssl_client_cert: None,
-        ssl_client_key: None,
-        dry_run: false,
-    };
-
-    let report = migrate(config.clone()).await.unwrap();
+    let migrations = kryzhen::file::load_dir(&dir).unwrap();
+    let report = migrate(&mut client, &migrations, false).await.unwrap();
     assert_eq!(report.applied, vec!["a".to_string(), "b".to_string()]);
 
-    let report2 = migrate(config).await.unwrap();
+    let report2 = migrate(&mut client, &migrations, false).await.unwrap();
     assert!(report2.applied.is_empty());
 
     std::fs::remove_dir_all(&dir).ok();
@@ -132,31 +118,14 @@ fn stage_mallard_migrations(tag: &str) -> std::path::PathBuf {
     dst
 }
 
-/// kryzhen applies mallard's own example-contacts migration tree end-to-end, in correct
-/// dependency order, against a real PostgreSQL — and is idempotent on a second run.
 #[tokio::test]
 async fn applies_mallard_example_contacts_tree() {
-    let (_client, node) = connect().await;
-    let port = node.get_host_port_ipv4(5432).await.unwrap();
+    let (mut client, _node) = connect().await;
 
     let dir = stage_mallard_migrations("apply");
-    let config = Config {
-        root: dir.clone(),
-        host: "127.0.0.1".into(),
-        port,
-        user: "postgres".into(),
-        password: "postgres".into(),
-        database: "postgres".into(),
-        sslmode: kryzhen::SslMode::Disable,
-        ssl_root_cert: None,
-        ssl_client_cert: None,
-        ssl_client_key: None,
-        dry_run: false,
-    };
+    let migrations = kryzhen::file::load_dir(&dir).unwrap();
 
-    let report = migrate(config.clone()).await.unwrap();
-    // schema has no deps; person requires schema; phone requires person;
-    // phone/name requires phone. Topological order is fully determined here.
+    let report = migrate(&mut client, &migrations, false).await.unwrap();
     assert_eq!(
         report.applied,
         vec![
@@ -167,19 +136,13 @@ async fn applies_mallard_example_contacts_tree() {
         ]
     );
 
-    // Re-running applies nothing (idempotent) and the tamper-detection checksum pass
-    // succeeds, proving the stored checksums round-trip and match on re-read.
-    let report2 = migrate(config).await.unwrap();
+    let report2 = migrate(&mut client, &migrations, false).await.unwrap();
     assert!(report2.applied.is_empty());
     assert_eq!(report2.already_applied.len(), 4);
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// In `phone.sql` the second block (`tables/phone/name`) already *explicitly* requires
-/// its in-file predecessor (`tables/phone`). kryzhen's implicit in-file linear
-/// dependency must therefore NOT add a duplicate — the persisted `requires` for that
-/// migration must be exactly `["tables/phone"]`.
 #[test]
 fn implicit_dep_does_not_duplicate_explicit_predecessor() {
     let migs = kryzhen::file::load_dir(&mallard_example_dir().join("tables")).unwrap();
@@ -194,9 +157,6 @@ fn implicit_dep_does_not_duplicate_explicit_predecessor() {
     );
 }
 
-/// mallard's example ships a `#!test` block (`tests/sample-person.sql`). kryzhen does
-/// not support tests, so loading the FULL example tree (including `tests/`) must fail
-/// with a parse error rather than silently ignoring it.
 #[test]
 fn mallard_test_block_is_rejected() {
     let err = kryzhen::file::load_dir(&mallard_example_dir()).unwrap_err();
@@ -207,28 +167,7 @@ fn mallard_test_block_is_rejected() {
 }
 
 /// kryzhen connects and applies a migration over a real TLS handshake.
-///
-/// The stock `testcontainers` Postgres image starts with `ssl=off` and offers no helper
-/// to enable it, so this test runs against an externally provided TLS-enabled server
-/// instead of spinning up its own container. It is opt-in: set `KRYZHEN_TLS_DSN_PORT`
-/// to the host port of a PostgreSQL started with `ssl=on` (user `postgres`, password
-/// `postgres`, database `postgres`). When the var is unset the test is skipped.
-///
-/// Bring such a server up with:
-/// ```text
-/// openssl req -new -x509 -days 1 -nodes -subj /CN=localhost -out /tmp/server.crt -keyout /tmp/server.key
-/// docker run -d --name kryzhen-tls -e POSTGRES_PASSWORD=postgres -p 55432:5432 \
-///   -v /tmp/server.crt:/certs/server.crt:ro -v /tmp/server.key:/certs/server.key:ro postgres:17 \
-///   bash -c 'install -o postgres -g postgres -m 0600 /certs/server.key /var/lib/postgresql/server.key && \
-///            install -o postgres -g postgres -m 0644 /certs/server.crt /var/lib/postgresql/server.crt && \
-///            exec docker-entrypoint.sh postgres -c ssl=on \
-///              -c ssl_cert_file=/var/lib/postgresql/server.crt -c ssl_key_file=/var/lib/postgresql/server.key'
-/// KRYZHEN_TLS_DSN_PORT=55432 cargo test -p kryzhen --test applier migrate_over_tls_require
-/// ```
-///
-/// `sslmode=require` fails unless TLS is actually negotiated, so a passing run proves the
-/// native-tls connector path (including `danger_accept_invalid_certs` against the
-/// self-signed cert) end to end.
+/// Set `KRYZHEN_TLS_DSN_PORT` to opt in (see inline docs for setup).
 #[tokio::test]
 async fn migrate_over_tls_require() {
     let Ok(port) = std::env::var("KRYZHEN_TLS_DSN_PORT") else {
@@ -239,8 +178,6 @@ async fn migrate_over_tls_require() {
         .parse()
         .expect("KRYZHEN_TLS_DSN_PORT must be a port number");
 
-    // Sanity-check the server really has TLS on, so a failure points at the fixture, not
-    // at kryzhen.
     let (probe, conn) = tokio_postgres::connect(
         &format!("host=127.0.0.1 port={port} user=postgres password=postgres dbname=postgres sslmode=disable"),
         NoTls,
@@ -250,11 +187,14 @@ async fn migrate_over_tls_require() {
     tokio::spawn(async move {
         let _ = conn.await;
     });
+
     let server_ssl: String = probe.query_one("SHOW ssl", &[]).await.unwrap().get(0);
     assert_eq!(server_ssl, "on", "fixture server must have ssl=on");
 
-    // Clean up any state left by a previous run so the test is idempotent.
-    probe.batch_execute("DROP TABLE IF EXISTS tls_t; DROP SCHEMA IF EXISTS mallard CASCADE;").await.unwrap();
+    probe
+        .batch_execute("DROP TABLE IF EXISTS tls_t; DROP SCHEMA IF EXISTS mallard CASCADE;")
+        .await
+        .unwrap();
 
     let dir = std::env::temp_dir().join(format!("kryzhen-tls-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -264,21 +204,23 @@ async fn migrate_over_tls_require() {
     )
     .unwrap();
 
-    let config = Config {
-        root: dir.clone(),
-        host: "127.0.0.1".into(),
-        port,
-        user: "postgres".into(),
-        password: "postgres".into(),
-        database: "postgres".into(),
-        sslmode: kryzhen::SslMode::Require,
-        ssl_root_cert: None,
-        ssl_client_cert: None,
-        ssl_client_key: None,
-        dry_run: false,
-    };
+    let builder = native_tls::TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let connector = postgres_native_tls::MakeTlsConnector::new(builder);
+    let conn_str = format!(
+        "host=127.0.0.1 port={port} user=postgres password=postgres dbname=postgres sslmode=require"
+    );
+    let (mut client, conn) = tokio_postgres::connect(&conn_str, connector)
+        .await
+        .expect("connect with sslmode=require");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
 
-    let report = migrate(config)
+    let migrations = kryzhen::file::load_dir(&dir).unwrap();
+    let report = migrate(&mut client, &migrations, false)
         .await
         .expect("migrate over sslmode=require should succeed");
     assert_eq!(report.applied, vec!["a".to_string()]);

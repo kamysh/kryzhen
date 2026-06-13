@@ -81,20 +81,22 @@ Each migration runs inside its own transaction together with its bookkeeping `IN
 
 ## Library usage
 
-The preferred way to construct a `Config` is through the builder:
+The caller owns the database connection. Build it with `tokio_postgres` and pass it to
+`migrate`:
 
 ```rust
-use kryzhen::{migrate, Config, SslMode};
-use std::path::PathBuf;
+use kryzhen::{file, migrate, Report};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let report = migrate(
-        Config::builder(PathBuf::from("migrations"), "127.0.0.1", 5432, "postgres", "secret", "mydb")
-            .sslmode(SslMode::Require)
-            .build(),
-    )
-    .await?;
+    let (mut client, conn) = tokio_postgres::connect(
+        "host=127.0.0.1 user=postgres dbname=mydb",
+        tokio_postgres::NoTls,
+    ).await?;
+    tokio::spawn(async move { let _ = conn.await; });
+
+    let migrations = file::load_dir("migrations")?;
+    let report: Report = migrate(&mut client, &migrations, false).await?;
 
     println!("Applied:         {:?}", report.applied);
     println!("Already applied: {:?}", report.already_applied);
@@ -102,35 +104,8 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-Struct literal construction is also supported for all fields.
-
-### `Config` fields
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `root` | `PathBuf` | *(required)* | Root directory of the migration tree. |
-| `host` | `String` | *(required)* | PostgreSQL host. |
-| `port` | `u16` | *(required)* | PostgreSQL port. |
-| `user` | `String` | *(required)* | Database user. |
-| `password` | `String` | *(required)* | Database password (may be empty). |
-| `database` | `String` | *(required)* | Database name. |
-| `sslmode` | `SslMode` | `Prefer` | TLS negotiation mode. See [TLS](#tls). |
-| `ssl_root_cert` | `Option<PathBuf>` | `None` | CA certificate for `verify-ca` / `verify-full` (PEM). |
-| `ssl_client_cert` | `Option<PathBuf>` | `None` | Client certificate for mutual TLS (PEM). |
-| `ssl_client_key` | `Option<PathBuf>` | `None` | Client private key for mutual TLS (PEM). |
-| `dry_run` | `bool` | `false` | If `true`, resolve and plan but apply nothing. Still connects to load applied migrations and verify checksums. |
-
-### `ConfigBuilder` methods
-
-| Method | Description |
-|---|---|
-| `Config::builder(root, host, port, user, password, database)` | Create a builder with required fields. |
-| `.sslmode(SslMode)` | Set the TLS negotiation mode (default: `Prefer`). |
-| `.ssl_root_cert(path)` | Set the CA certificate path for `verify-ca` / `verify-full`. |
-| `.ssl_client_cert(path)` | Set the client certificate path for mutual TLS. |
-| `.ssl_client_key(path)` | Set the client private key path for mutual TLS. |
-| `.dry_run(bool)` | Enable or disable dry-run mode. |
-| `.build()` | Consume the builder and return a `Config`. |
+Pass `dry_run = true` to resolve and plan without applying anything (still connects and
+verifies checksums).
 
 ### `Report` fields
 
@@ -198,6 +173,74 @@ For `verify-ca` and `verify-full`, set `ssl_root_cert` (library) or `--ssl-root-
 To present a client certificate to the server (for PostgreSQL `clientcert=verify-full` authentication), set both `ssl_client_cert` and `ssl_client_key` (library) or `--ssl-client-cert` and `--ssl-client-key` (CLI). Mutual TLS can be combined with any sslmode that establishes a TLS connection (`prefer`, `require`, `verify-ca`, `verify-full`).
 
 TLS uses OpenSSL (via `native-tls`), so the build needs OpenSSL and `pkg-config` available — see [docs/development.md](docs/development.md).
+
+---
+
+## Escape hatches
+
+The `kryzhen hack` subcommand provides low-level manipulation of `mallard.applied_migrations` for situations where normal migration flow isn't sufficient.
+
+### `hack add` — record a migration as applied without running its SQL
+
+```bash
+kryzhen hack add <NAME> --root migrations/ --database mydb
+```
+
+Inserts a row for `NAME` into `mallard.applied_migrations` without executing the SQL body. Useful when a migration has already been applied by other means (e.g. provisioned by Terraform, applied by another tool). Fails if any of the migration's `requires` are not yet applied.
+
+### `hack delete` — remove a migration record without running any SQL
+
+```bash
+kryzhen hack delete <NAME> --database mydb
+```
+
+Removes the `NAME` row from `mallard.applied_migrations`. Fails if any currently-applied migration lists `NAME` in its `requires`.
+
+### `hack fix-checksum` — update a stored checksum to match the current file
+
+```bash
+kryzhen hack fix-checksum <NAME> --root migrations/ --database mydb
+```
+
+Recomputes the checksum from the current on-disk content of migration `NAME` and overwrites the stored value in `mallard.applied_migrations`. Use this when a migration file was legitimately edited after it was applied (e.g. reformatted, whitespace-only change) and tamper detection is now blocking normal runs with:
+
+```
+checksum mismatch for already-applied migration [NAME]: file content changed — run `kryzhen hack fix-checksum NAME` to update
+```
+
+> **Warning:** `hack fix-checksum` bypasses tamper detection. Only use it when you are certain the file change was intentional and harmless.
+
+---
+
+## Migrating from sqlx
+
+If you have an existing project that uses [sqlx migrations](https://docs.rs/sqlx/latest/sqlx/migrate/index.html), `kryzhen hack migrate-from sqlx` imports your applied migration history into `mallard.applied_migrations` in two phases:
+
+```bash
+# Phase 1: verify checksums, rewrite files with #!migration headers, write receipt
+kryzhen hack migrate-from sqlx convert [MIGRATIONS_DIR] --database mydb
+
+# Phase 2: re-verify _sqlx_migrations against the receipt, insert into mallard
+kryzhen hack migrate-from sqlx import [MIGRATIONS_DIR] --database mydb
+
+# Or run both phases in one command:
+kryzhen hack migrate-from sqlx all [MIGRATIONS_DIR] --database mydb
+```
+
+`MIGRATIONS_DIR` defaults to `.`. The `_sqlx_migrations` table is never modified.
+
+After a successful import you can use `kryzhen migrate` as normal. sqlx should no longer manage those migrations.
+
+### What each phase does
+
+| Phase | Input | Output |
+|---|---|---|
+| `convert` | `_sqlx_migrations` rows + original files | Files rewritten with `#!migration` headers; `.kryzhen-import-receipt.json` written |
+| `import` | Receipt + `_sqlx_migrations` (re-verified) + converted files | Rows inserted into `mallard.applied_migrations` |
+
+### Team workflow
+
+After Person A runs `convert` and `import`, commit both the rewritten `.sql` files and `.kryzhen-import-receipt.json` to git. Teammates who sync the repo run only `import` — it re-verifies their `_sqlx_migrations` against the receipt and inserts any missing rows, skipping rows already present.
 
 ---
 

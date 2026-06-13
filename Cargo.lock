@@ -1057,10 +1057,12 @@ dependencies = [
 
 [[package]]
 name = "kryzhen"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "native-tls",
  "postgres-native-tls",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "testcontainers",
  "testcontainers-modules",
@@ -1072,12 +1074,16 @@ dependencies = [
 
 [[package]]
 name = "kryzhen-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
  "kryzhen",
+ "native-tls",
+ "postgres-native-tls",
+ "serde_json",
  "tokio",
+ "tokio-postgres",
  "tracing",
  "tracing-subscriber",
 ]

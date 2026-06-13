@@ -43,7 +43,7 @@ pub enum Error {
     },
     #[error("dependency cycle detected involving: {0:?}")]
     Cycle(Vec<MigrationName>),
-    #[error("checksum mismatch for already-applied migration {0}: file content changed")]
+    #[error("checksum mismatch for already-applied migration [{0}]: file content changed — run `kryzhen hack fix-checksum {0}` to update")]
     ChecksumMismatch(MigrationName),
     #[error("migration {name} has a {len}-byte checksum in the database; expected 32")]
     CorruptChecksum { name: MigrationName, len: usize },

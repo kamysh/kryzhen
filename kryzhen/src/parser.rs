@@ -1,6 +1,12 @@
 //! Parser for migration files: splits a `.sql` file into its `#!migration` blocks (in
 //! file order) and parses each block's header fields and SQL body. `#!test` blocks are
 //! rejected. See [`parse_file`].
+//!
+//! Faithfully mirrors the Haskell mallard Megaparsec grammar:
+//! - `-` is treated as whitespace (transparently skips `-- ` comment prefixes)
+//! - Quoted strings allow any character except `"` (including `;`, `,`, backticks)
+//! - Fields are `key: value` pairs separated by `,`; the header ends at the first
+//!   unquoted `;`
 
 use crate::types::{checksum, Migration, MigrationName};
 use crate::{Error, Result};
@@ -14,94 +20,160 @@ pub fn parse_file(text: &str, file_label: &str) -> Result<Vec<Migration>> {
     };
 
     let mut out = Vec::new();
-    for block in split_blocks(text) {
-        out.push(parse_block(&block, &err)?);
+    let mut p = Parser::new(text);
+    p.skip_ws();
+
+    while !p.is_eof() {
+        match p.find_shebang() {
+            None => break,
+            Some(pos) => p.pos = pos + 2,
+        }
+        let directive = p.read_word();
+        match directive.as_str() {
+            "migration" => out.push(parse_migration_block(&mut p, &err)?),
+            "test" => {
+                return Err(err(
+                    "unsupported directive `#!test` (only `#!migration` is supported)".into(),
+                ))
+            }
+            other => {
+                return Err(err(format!(
+                    "unsupported directive `#!{other}` (only `#!migration` is supported)"
+                )))
+            }
+        }
     }
     Ok(out)
 }
 
-/// A raw block: the directive keyword and the remaining text (header lines + body).
-struct RawBlock {
-    directive: String,
-    rest: String,
+// ---------------------------------------------------------------------------
+// Low-level parser state
+// ---------------------------------------------------------------------------
+
+struct Parser<'a> {
+    src: &'a str,
+    pos: usize,
 }
 
-/// Split file text on `#!`. Text before the first `#!` is ignored. Each `#!` starts a
-/// new block; the word immediately after `#!` is the directive. The block's text runs
-/// up to the next `#!` or EOF.
-fn split_blocks(text: &str) -> Vec<RawBlock> {
-    let mut blocks = Vec::new();
-    let mut search = text;
-    while let Some(idx) = search.find("#!") {
-        let after = &search[idx + 2..];
-        let dir_end = after.find(char::is_whitespace).unwrap_or(after.len());
-        let directive = after[..dir_end].to_string();
-        let rest_start = &after[dir_end..];
-        // The next block begins at its `#!`; back up to the start of that line so the
-        // line prefix (e.g. `-- `) stays with the next block rather than leaking into
-        // this block's body.
-        let next = match rest_start.find("#!") {
-            None => rest_start.len(),
-            Some(hash) => rest_start[..hash].rfind('\n').map_or(hash, |nl| nl + 1),
+impl<'a> Parser<'a> {
+    fn new(src: &'a str) -> Self {
+        Self { src, pos: 0 }
+    }
+
+    fn rest(&self) -> &'a str {
+        &self.src[self.pos..]
+    }
+
+    fn is_eof(&self) -> bool {
+        self.pos >= self.src.len()
+    }
+
+    /// Skip characters that are whitespace or `-` (mirrors mallard's spaceConsumer).
+    fn skip_ws(&mut self) {
+        while let Some(c) = self.rest().chars().next() {
+            if c.is_whitespace() || c == '-' {
+                self.pos += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Read alphanumeric/underscore word (field name or directive keyword), then skip_ws.
+    fn read_word(&mut self) -> String {
+        let start = self.pos;
+        while let Some(c) = self.rest().chars().next() {
+            if c.is_alphanumeric() || c == '_' {
+                self.pos += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let word = self.src[start..self.pos].to_string();
+        self.skip_ws();
+        word
+    }
+
+    /// Expect a specific character (after skip_ws), advance past it and skip_ws again.
+    fn expect(&mut self, ch: char, err: &impl Fn(String) -> Error) -> Result<()> {
+        self.skip_ws();
+        match self.rest().chars().next() {
+            Some(c) if c == ch => {
+                self.pos += ch.len_utf8();
+                self.skip_ws();
+                Ok(())
+            }
+            Some(c) => Err(err(format!("expected `{ch}`, got `{c}`"))),
+            None => Err(err(format!("expected `{ch}`, got end of file"))),
+        }
+    }
+
+    /// Try to consume a specific character (after skip_ws); return true if consumed.
+    fn try_consume(&mut self, ch: char) -> bool {
+        self.skip_ws();
+        if self.rest().starts_with(ch) {
+            self.pos += ch.len_utf8();
+            self.skip_ws();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Parse a double-quoted string: any chars except `"`. Mirrors `noneOf "\""`.
+    fn parse_quoted(&mut self, err: &impl Fn(String) -> Error) -> Result<String> {
+        self.skip_ws();
+        if !self.rest().starts_with('"') {
+            return Err(err(format!(
+                "expected a quoted string, got `{}`",
+                self.rest()
+                    .chars()
+                    .next()
+                    .map_or_else(|| "EOF".to_string(), |c| c.to_string())
+            )));
+        }
+        self.pos += 1; // opening "
+        match self.rest().find('"') {
+            None => Err(err("unterminated quoted string".into())),
+            Some(i) => {
+                let s = self.src[self.pos..self.pos + i].to_string();
+                self.pos += i + 1; // closing "
+                self.skip_ws();
+                Ok(s)
+            }
+        }
+    }
+
+    /// Find the byte offset of the next `#!` in the remaining text, or None.
+    fn find_shebang(&self) -> Option<usize> {
+        self.rest().find("#!").map(|i| self.pos + i)
+    }
+
+    /// Collect raw body text up to (but not including) the next `#!` or EOF.
+    /// Backs up to the start of the line containing `#!` so `-- #!` prefixes
+    /// belong to the next block. Trims surrounding whitespace and `-`.
+    fn read_body(&mut self) -> String {
+        let start = self.pos;
+        let end = match self.rest().find("#!") {
+            None => self.src.len(),
+            Some(i) => {
+                let abs = self.pos + i;
+                self.src[start..abs]
+                    .rfind('\n')
+                    .map_or(abs, |nl| start + nl + 1)
+            }
         };
-        blocks.push(RawBlock {
-            directive,
-            rest: rest_start[..next].to_string(),
-        });
-        search = &rest_start[next..];
+        self.pos = end;
+        let raw = &self.src[start..end];
+        // Mirror mallard's `dropWhileEnd isWhiteSpace` (isWhiteSpace includes '-')
+        let trimmed = raw.trim_end_matches(|c: char| c.is_whitespace() || c == '-');
+        trimmed.trim().to_string()
     }
-    blocks
 }
 
-fn parse_block(block: &RawBlock, err: &impl Fn(String) -> Error) -> Result<Migration> {
-    if block.directive != "migration" {
-        return Err(err(format!(
-            "unsupported directive `#!{}` (only `#!migration` is supported)",
-            block.directive
-        )));
-    }
-
-    // Header field list ends at the first `;`.
-    let semi = block
-        .rest
-        .find(';')
-        .ok_or_else(|| err("header is missing its terminating `;`".into()))?;
-    let header_region = &block.rest[..semi];
-    let body = block.rest[semi + 1..].trim();
-
-    // Strip leading `--` from each comment line and join into one field string.
-    let header_text: String = header_region
-        .lines()
-        .map(|l| l.trim_start().trim_start_matches("--").trim())
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let fields = parse_fields(&header_text, err)?;
-
-    let name = fields
-        .iter()
-        .find(|(k, _)| k == "name")
-        .and_then(|(_, v)| v.as_str())
-        .ok_or_else(|| err("missing or non-string `name` field".into()))?;
-    let description = fields
-        .iter()
-        .find(|(k, _)| k == "description")
-        .and_then(|(_, v)| v.as_str())
-        .ok_or_else(|| err("missing or non-string `description` field".into()))?;
-    let requires = match fields.iter().find(|(k, _)| k == "requires") {
-        None => Vec::new(),
-        Some((_, FieldValue::Text(s))) => vec![MigrationName(s.clone())],
-        Some((_, FieldValue::List(xs))) => xs.iter().cloned().map(MigrationName).collect(),
-    };
-
-    Ok(Migration {
-        name: MigrationName(name.to_string()),
-        description: description.to_string(),
-        requires,
-        checksum: checksum(body),
-        script: body.to_string(),
-    })
-}
+// ---------------------------------------------------------------------------
+// Field value
+// ---------------------------------------------------------------------------
 
 enum FieldValue {
     Text(String),
@@ -117,90 +189,104 @@ impl FieldValue {
     }
 }
 
-/// Parse `key: value, key: value` where value is `"..."` or `["a", "b"]`.
-fn parse_fields(text: &str, err: &impl Fn(String) -> Error) -> Result<Vec<(String, FieldValue)>> {
+// ---------------------------------------------------------------------------
+// Header field parsing
+// ---------------------------------------------------------------------------
+
+/// Parse `key: value` pairs separated by `,`, ending at `;`.
+/// Mirrors mallard's `parseHeaderFields` + `semiColon`.
+fn parse_header_fields(
+    p: &mut Parser<'_>,
+    err: &impl Fn(String) -> Error,
+) -> Result<Vec<(String, FieldValue)>> {
     let mut fields = Vec::new();
-    for raw in split_top_level_commas(text) {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            continue;
+    loop {
+        p.skip_ws();
+        if p.try_consume(';') {
+            break;
         }
-        let colon = raw
-            .find(':')
-            .ok_or_else(|| err(format!("malformed header field: `{raw}`")))?;
-        let key = raw[..colon].trim().to_string();
-        let value = raw[colon + 1..].trim();
-        let parsed = if value.starts_with('[') {
-            FieldValue::List(parse_string_list(value, err)?)
-        } else {
-            FieldValue::Text(parse_quoted(value, err)?)
-        };
-        fields.push((key, parsed));
+        if !fields.is_empty() {
+            p.expect(',', err)?;
+            if p.try_consume(';') {
+                break;
+            }
+        }
+        let key = p.read_word();
+        if key.is_empty() {
+            return Err(err("header is missing its terminating `;`".into()));
+        }
+        p.expect(':', err)?;
+        let value = parse_field_value(p, err)?;
+        fields.push((key, value));
     }
     Ok(fields)
 }
 
-/// Split on commas that are not inside `[...]` or `"..."`.
-fn split_top_level_commas(text: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut cur = String::new();
-    let mut in_quote = false;
-    let mut depth = 0i32;
-    for c in text.chars() {
-        match c {
-            '"' => {
-                in_quote = !in_quote;
-                cur.push(c);
+fn parse_field_value(p: &mut Parser<'_>, err: &impl Fn(String) -> Error) -> Result<FieldValue> {
+    p.skip_ws();
+    if p.rest().starts_with('[') {
+        p.pos += 1; // `[`
+        p.skip_ws();
+        let mut items = Vec::new();
+        if !p.try_consume(']') {
+            loop {
+                items.push(p.parse_quoted(err)?);
+                if p.try_consume(']') {
+                    break;
+                }
+                p.expect(',', err)?;
             }
-            '[' if !in_quote => {
-                depth += 1;
-                cur.push(c);
-            }
-            ']' if !in_quote => {
-                depth -= 1;
-                cur.push(c);
-            }
-            ',' if !in_quote && depth == 0 => {
-                parts.push(std::mem::take(&mut cur));
-            }
-            _ => cur.push(c),
         }
+        Ok(FieldValue::List(items))
+    } else {
+        Ok(FieldValue::Text(p.parse_quoted(err)?))
     }
-    parts.push(cur);
-    parts
 }
 
-/// Strip surrounding double quotes; error if absent.
-///
-/// Backslash-escaped quotes inside header strings are NOT supported: a `"` always
-/// ends the string. This matches the upstream mallard format, whose parser uses
-/// `noneOf "\""` and likewise does not handle escapes.
-fn parse_quoted(value: &str, err: &impl Fn(String) -> Error) -> Result<String> {
-    let v = value.trim();
-    let inner = v
-        .strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .ok_or_else(|| err(format!("expected a quoted string, got `{v}`")))?;
-    Ok(inner.to_string())
+// ---------------------------------------------------------------------------
+// Migration block
+// ---------------------------------------------------------------------------
+
+fn parse_migration_block(
+    p: &mut Parser<'_>,
+    err: &impl Fn(String) -> Error,
+) -> Result<Migration> {
+    let fields = parse_header_fields(p, err)?;
+
+    let name = fields
+        .iter()
+        .find(|(k, _)| k == "name")
+        .and_then(|(_, v)| v.as_str())
+        .ok_or_else(|| err("missing or non-string `name` field".into()))?
+        .to_string();
+
+    let description = fields
+        .iter()
+        .find(|(k, _)| k == "description")
+        .and_then(|(_, v)| v.as_str())
+        .ok_or_else(|| err("missing or non-string `description` field".into()))?
+        .to_string();
+
+    let requires = match fields.iter().find(|(k, _)| k == "requires") {
+        None => Vec::new(),
+        Some((_, FieldValue::Text(s))) => vec![MigrationName(s.clone())],
+        Some((_, FieldValue::List(xs))) => xs.iter().cloned().map(MigrationName).collect(),
+    };
+
+    let body = p.read_body();
+
+    Ok(Migration {
+        name: MigrationName(name),
+        description,
+        requires,
+        checksum: checksum(&body),
+        script: body,
+    })
 }
 
-/// Parse `["a", "b"]` into a vec of strings.
-fn parse_string_list(value: &str, err: &impl Fn(String) -> Error) -> Result<Vec<String>> {
-    let v = value.trim();
-    let inner = v
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .ok_or_else(|| err(format!("expected a list `[...]`, got `{v}`")))?;
-    let mut out = Vec::new();
-    for item in split_top_level_commas(inner) {
-        let item = item.trim();
-        if item.is_empty() {
-            continue;
-        }
-        out.push(parse_quoted(item, err)?);
-    }
-    Ok(out)
-}
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -298,12 +384,30 @@ SELECT 1;
 
     #[test]
     fn missing_semicolon_is_error() {
-        // No `;` anywhere in the block, so the header field list is unterminated and
-        // `find(';')` returns None — exercises the "missing terminating `;`" branch.
         let text = "-- #!migration\n-- name: \"x\", description: \"y\"\nSELECT 1\n";
         assert!(matches!(
             parse_file(text, "x.sql").unwrap_err(),
             Error::Parse { .. }
         ));
+    }
+
+    #[test]
+    fn description_with_semicolon_and_backticks() {
+        let text = concat!(
+            "-- #!migration\n",
+            "-- name: \"belief-embeddings\",\n",
+            "-- description: \"embeddings; backfilled by `mimir reembed`\",\n",
+            "-- requires: \"database-search-path\";\n",
+            "CREATE TABLE t ();\n",
+        );
+        let m = parse_file(text, "003.sql").unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].name, MigrationName("belief-embeddings".into()));
+        assert!(m[0].description.contains(';'));
+        assert!(m[0].description.contains('`'));
+        assert_eq!(
+            m[0].requires,
+            vec![MigrationName("database-search-path".into())]
+        );
     }
 }
