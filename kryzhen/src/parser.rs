@@ -247,10 +247,7 @@ fn parse_field_value(p: &mut Parser<'_>, err: &impl Fn(String) -> Error) -> Resu
 // Migration block
 // ---------------------------------------------------------------------------
 
-fn parse_migration_block(
-    p: &mut Parser<'_>,
-    err: &impl Fn(String) -> Error,
-) -> Result<Migration> {
+fn parse_migration_block(p: &mut Parser<'_>, err: &impl Fn(String) -> Error) -> Result<Migration> {
     let fields = parse_header_fields(p, err)?;
 
     let name = fields

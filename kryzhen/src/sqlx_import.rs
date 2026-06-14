@@ -2,11 +2,13 @@
 //!
 //! [`convert`] reads `_sqlx_migrations`, verifies file checksums against the
 //! DB, rewrites files with `#!migration` headers, and writes a receipt that
-//! anchors the sqlx checksums. [`import`] reads the receipt, re-verifies
-//! `_sqlx_migrations` checksums, and inserts rows into
-//! `mallard.applied_migrations` (idempotent — skips already-present rows).
+//! anchors the sqlx checksums. [`import`] accepts a pre-parsed [`Receipt`] and
+//! a pre-loaded `&[Migration]` slice, re-verifies `_sqlx_migrations` checksums,
+//! and inserts rows into `mallard.applied_migrations` (idempotent — skips
+//! already-present rows). The caller owns file/receipt loading; [`import`] does
+//! only DB work.
 
-use crate::types::{checksum, MigrationName};
+use crate::types::{Migration, MigrationName};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha384};
 use std::path::{Path, PathBuf};
@@ -248,15 +250,17 @@ pub async fn convert(
 /// Verify `_sqlx_migrations` against the receipt, then insert rows into
 /// `mallard.applied_migrations`. Already-present rows are skipped silently.
 ///
-/// Requires a receipt written by [`convert`]. Fails if `_sqlx_migrations`
-/// does not match the receipt (wrong machine, wrong DB, or DB not migrated
-/// with sqlx yet).
+/// The caller is responsible for loading `receipt` (e.g. via
+/// [`read_receipt`]) and `migrations` (e.g. via [`kryzhen::file::load_dir`]).
+/// This function performs only DB work.
+///
+/// Fails if `_sqlx_migrations` does not match the receipt (wrong machine,
+/// wrong DB, or DB not migrated with sqlx yet).
 pub async fn import(
     client: &impl GenericClient,
-    migrations_dir: &Path,
+    receipt: &Receipt,
+    migrations: &[Migration],
 ) -> std::result::Result<Receipt, SqlxImportError> {
-    let receipt = read_receipt(migrations_dir)?;
-
     // If _sqlx_migrations was already dropped by a prior import run, we're done.
     let exists: bool = client
         .query_one(
@@ -267,7 +271,10 @@ pub async fn import(
         .await?
         .get(0);
     if !exists {
-        return Ok(Receipt { already_imported: true, ..receipt });
+        return Ok(Receipt {
+            already_imported: true,
+            ..receipt.clone()
+        });
     }
 
     // Re-verify _sqlx_migrations against receipt checksums.
@@ -314,19 +321,15 @@ pub async fn import(
             continue;
         }
 
-        let path = migrations_dir.join(&entry.filename);
-        let content = std::fs::read_to_string(&path)?;
-        let migrations = crate::parser::parse_file(&content, &entry.filename)
-            .map_err(|e| SqlxImportError::Io(std::io::Error::other(e.to_string())))?;
-        let body = migrations
-            .into_iter()
+        let migration = migrations
+            .iter()
             .find(|m| m.name.0 == entry.kryzhen_name)
-            .map(|m| m.script)
-            .ok_or_else(|| SqlxImportError::Io(std::io::Error::other(format!(
-                "migration '{}' not found in file '{}'",
-                entry.kryzhen_name, entry.filename
-            ))))?;
-        let checksum_bytes = checksum(&body);
+            .ok_or_else(|| {
+                SqlxImportError::Io(std::io::Error::other(format!(
+                    "migration '{}' not found in supplied migrations slice",
+                    entry.kryzhen_name
+                )))
+            })?;
 
         let description = if entry.sqlx_description.is_empty() {
             entry.kryzhen_name.clone()
@@ -349,8 +352,8 @@ pub async fn import(
                     &entry.kryzhen_name,
                     &description,
                     &requires,
-                    &checksum_bytes.as_slice(),
-                    &body,
+                    &migration.checksum.as_slice(),
+                    &migration.script,
                 ],
             )
             .await?;
@@ -360,7 +363,7 @@ pub async fn import(
         .execute("DROP TABLE IF EXISTS _sqlx_migrations", &[])
         .await?;
 
-    Ok(receipt)
+    Ok(receipt.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -377,15 +380,22 @@ fn write_receipt(dir: &Path, receipt: &Receipt) -> std::result::Result<(), SqlxI
     Ok(())
 }
 
-fn read_receipt(dir: &Path) -> std::result::Result<Receipt, SqlxImportError> {
-    let path = receipt_path(dir);
+/// Conventional receipt filename within a migrations directory.
+pub const RECEIPT_FILENAME: &str = ".kryzhen-import-receipt.json";
+
+/// Load a [`Receipt`] from the given file path.
+///
+/// Returns [`SqlxImportError::NoReceipt`] when the file is absent (fresh
+/// install — no sqlx history to import).
+pub fn read_receipt(path: &Path) -> std::result::Result<Receipt, SqlxImportError> {
     if !path.exists() {
-        return Err(SqlxImportError::NoReceipt { path });
+        return Err(SqlxImportError::NoReceipt {
+            path: path.to_owned(),
+        });
     }
-    let json = std::fs::read_to_string(&path)?;
+    let json = std::fs::read_to_string(path)?;
     Ok(serde_json::from_str(&json)?)
 }
-
 
 fn build_header(name: &str, description: &str, requires: &[String]) -> String {
     let mut lines = vec![

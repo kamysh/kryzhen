@@ -394,8 +394,11 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("--dry-run is not supported for 'hack migrate-from sqlx import'; omit it to run for real");
             }
             let root = require_root(args.root)?;
+            let receipt_path = root.join(sqlx_import::RECEIPT_FILENAME);
+            let receipt = sqlx_import::read_receipt(&receipt_path).map_err(fmt_sqlx_err)?;
+            let migrations = file::load_dir(&root)?;
             let client = connect(&db).await?;
-            let receipt = sqlx_import::import(&client, &root)
+            let receipt = sqlx_import::import(&client, &receipt, &migrations)
                 .await
                 .map_err(fmt_sqlx_err)?;
             if receipt.already_imported {
@@ -437,13 +440,19 @@ async fn main() -> anyhow::Result<()> {
             }
 
             print!("Phase 2/2 import... ");
-            let r = sqlx_import::import(&client, &root)
+            let receipt_path = root.join(sqlx_import::RECEIPT_FILENAME);
+            let receipt = sqlx_import::read_receipt(&receipt_path).map_err(fmt_sqlx_err)?;
+            let migrations = file::load_dir(&root)?;
+            let r = sqlx_import::import(&client, &receipt, &migrations)
                 .await
                 .map_err(fmt_sqlx_err)?;
             if r.already_imported {
                 println!("already imported (_sqlx_migrations not present).");
             } else {
-                println!("{} migration(s) imported. _sqlx_migrations dropped.", r.migrations.len());
+                println!(
+                    "{} migration(s) imported. _sqlx_migrations dropped.",
+                    r.migrations.len()
+                );
             }
 
             println!("\nDone. You can now use `kryzhen migrate` as normal.");
