@@ -70,12 +70,18 @@ pub enum SqlxImportError {
         db_hex: String,
     },
     #[error(
-        "_sqlx_migrations has {db_count} applied migration(s) but receipt has {receipt_count}"
+        "_sqlx_migrations contains version {present_version} but its receipt predecessor \
+         version {missing_version} is absent — history is inconsistent"
     )]
-    CountMismatch {
-        db_count: usize,
-        receipt_count: usize,
+    InconsistentHistory {
+        missing_version: i64,
+        present_version: i64,
     },
+    #[error(
+        "_sqlx_migrations contains version {version} which is not in the receipt — \
+         unknown migration; cannot import"
+    )]
+    UnknownMigration { version: i64 },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
@@ -277,7 +283,7 @@ pub async fn import(
         });
     }
 
-    // Re-verify _sqlx_migrations against receipt checksums.
+    // Load _sqlx_migrations rows ordered by version.
     let rows = client
         .query(
             "SELECT version, description, checksum FROM _sqlx_migrations \
@@ -286,16 +292,23 @@ pub async fn import(
         )
         .await?;
 
-    if rows.len() != receipt.migrations.len() {
-        return Err(SqlxImportError::CountMismatch {
-            db_count: rows.len(),
-            receipt_count: receipt.migrations.len(),
-        });
-    }
+    // Build version → receipt entry lookup.
+    let receipt_by_version: std::collections::HashMap<i64, &ReceiptEntry> =
+        receipt.migrations.iter().map(|e| (e.version, e)).collect();
 
-    for (row, entry) in rows.iter().zip(receipt.migrations.iter()) {
+    // Collect DB versions as an ordered set for prefix-consistency check.
+    let db_versions: Vec<i64> = rows.iter().map(|r| r.get(0)).collect();
+
+    // Verify each DB row:
+    // (a) must exist in the receipt (no unknown migrations),
+    // (b) checksum must match the receipt.
+    for row in &rows {
+        let version: i64 = row.get(0);
         let sqlx_checksum: Vec<u8> = row.get(2);
         let db_hex = hex(&sqlx_checksum);
+        let entry = receipt_by_version
+            .get(&version)
+            .ok_or(SqlxImportError::UnknownMigration { version })?;
         if db_hex != entry.sqlx_checksum_hex {
             return Err(SqlxImportError::ReceiptDbMismatch {
                 name: entry.kryzhen_name.clone(),
@@ -305,17 +318,38 @@ pub async fn import(
         }
     }
 
+    // Verify prefix consistency: for every DB version, all receipt entries
+    // with a lower version must also be present in the DB.
+    let db_version_set: std::collections::HashSet<i64> = db_versions.iter().copied().collect();
+    for &present in &db_versions {
+        for entry in &receipt.migrations {
+            if entry.version < present && !db_version_set.contains(&entry.version) {
+                return Err(SqlxImportError::InconsistentHistory {
+                    missing_version: entry.version,
+                    present_version: present,
+                });
+            }
+        }
+    }
+
+    // Collect receipt entries that were actually applied on this DB,
+    // preserving receipt order for correct requires-chain reconstruction.
+    let applied_entries: Vec<&ReceiptEntry> = receipt
+        .migrations
+        .iter()
+        .filter(|e| db_version_set.contains(&e.version))
+        .collect();
+
     // Insert into mallard.applied_migrations, skipping already-present rows.
     crate::postgres::ensure_schema(client).await?;
     let already_applied = crate::postgres::load_applied(client).await?;
 
-    let names: Vec<String> = receipt
-        .migrations
+    let applied_names: Vec<String> = applied_entries
         .iter()
         .map(|e| e.kryzhen_name.clone())
         .collect();
 
-    for (i, entry) in receipt.migrations.iter().enumerate() {
+    for (i, entry) in applied_entries.iter().enumerate() {
         let mname = MigrationName(entry.kryzhen_name.clone());
         if already_applied.contains_key(&mname) {
             continue;
@@ -338,7 +372,7 @@ pub async fn import(
         };
 
         let requires: Vec<String> = if i > 0 {
-            vec![names[i - 1].clone()]
+            vec![applied_names[i - 1].clone()]
         } else {
             vec![]
         };
