@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use kryzhen::sqlx_import::{self, SqlxImportError};
-use kryzhen::{file, hack_add, hack_delete, hack_fix_checksum, migrate};
+use kryzhen::{file, graph, hack_add, hack_delete, hack_fix_checksum, migrate};
 use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
 use std::path::PathBuf;
@@ -31,6 +31,8 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Parse migrations and verify all dependencies are satisfied.
+    Verify,
     /// Manually manipulate mallard.applied_migrations or migrate from other tools.
     Hack {
         #[command(subcommand)]
@@ -276,6 +278,18 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     match args.command {
+        // ------------------------------------------------------------------ verify
+        Some(Cmd::Verify) => {
+            init_logging(args.verbose);
+            let root = require_root(args.root)?;
+            let migrations = file::load_dir(&root)?;
+            let sorted = graph::topo_sort(migrations).map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("OK — {} migration(s) in dependency order:", sorted.len());
+            for m in &sorted {
+                println!("  {}", m.name);
+            }
+        }
+
         // ------------------------------------------------------------------ default: migrate
         None => {
             init_logging(args.verbose);
