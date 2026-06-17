@@ -35,8 +35,10 @@ enum Cmd {
     Verify,
     /// Manually manipulate mallard.applied_migrations or migrate from other tools.
     Hack {
+        // Boxed to keep the enum's variants similarly sized (clippy::large_enum_variant):
+        // HackCmd carries DbArgs plus nested subcommands and is far larger than `Verify`.
         #[command(subcommand)]
-        action: HackCmd,
+        action: Box<HackCmd>,
     },
 }
 
@@ -319,158 +321,147 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // ------------------------------------------------------------------ hack add
-        Some(Cmd::Hack {
-            action: HackCmd::Add { name, db, verbose },
-        }) => {
-            init_logging(verbose);
-            let root = require_root(args.root)?;
-            let client = connect(&db).await?;
-            let migrations = file::load_dir(&root)?;
-            hack_add(&client, &migrations, &name)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            println!("Recorded {name:?} as applied.");
-        }
-
-        // ------------------------------------------------------------------ hack delete
-        Some(Cmd::Hack {
-            action: HackCmd::Delete { name, db, verbose },
-        }) => {
-            init_logging(verbose);
-            let client = connect(&db).await?;
-            hack_delete(&client, &name)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            println!("Removed {name:?} from applied_migrations.");
-        }
-
-        // ------------------------------------------------------------------ hack fix-checksum
-        Some(Cmd::Hack {
-            action: HackCmd::FixChecksum { name, db, verbose },
-        }) => {
-            init_logging(verbose);
-            let root = require_root(args.root)?;
-            let client = connect(&db).await?;
-            let migrations = file::load_dir(&root)?;
-            hack_fix_checksum(&client, &migrations, &name)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            println!("Fixed checksum for {name:?}.");
-        }
-
-        // ------------------------------------------------------------------ hack migrate-from sqlx convert
-        Some(Cmd::Hack {
-            action:
-                HackCmd::MigrateFrom {
-                    source:
-                        MigrateFromCmd::Sqlx {
-                            phase: SqlxPhaseCmd::Convert { db, verbose },
-                        },
-                },
-        }) => {
-            init_logging(verbose);
-            if args.dry_run {
-                anyhow::bail!("--dry-run is not supported for 'hack migrate-from sqlx convert'; omit it to run for real");
+        // ------------------------------------------------------------------ hack *
+        // `action` is boxed (clippy::large_enum_variant); deref once and match.
+        Some(Cmd::Hack { action }) => match *action {
+            // ------------------------------------------------------------------ hack add
+            HackCmd::Add { name, db, verbose } => {
+                init_logging(verbose);
+                let root = require_root(args.root)?;
+                let client = connect(&db).await?;
+                let migrations = file::load_dir(&root)?;
+                hack_add(&client, &migrations, &name)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!("Recorded {name:?} as applied.");
             }
-            let root = require_root(args.root)?;
-            let client = connect(&db).await?;
-            let receipt = sqlx_import::convert(&client, &root)
-                .await
-                .map_err(fmt_sqlx_err)?;
-            if receipt.newly_converted == 0 {
-                println!(
+
+            // ------------------------------------------------------------------ hack delete
+            HackCmd::Delete { name, db, verbose } => {
+                init_logging(verbose);
+                let client = connect(&db).await?;
+                hack_delete(&client, &name)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!("Removed {name:?} from applied_migrations.");
+            }
+
+            // ------------------------------------------------------------------ hack fix-checksum
+            HackCmd::FixChecksum { name, db, verbose } => {
+                init_logging(verbose);
+                let root = require_root(args.root)?;
+                let client = connect(&db).await?;
+                let migrations = file::load_dir(&root)?;
+                hack_fix_checksum(&client, &migrations, &name)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!("Fixed checksum for {name:?}.");
+            }
+
+            // ------------------------------------------------------------------ hack migrate-from sqlx convert
+            HackCmd::MigrateFrom {
+                source:
+                    MigrateFromCmd::Sqlx {
+                        phase: SqlxPhaseCmd::Convert { db, verbose },
+                    },
+            } => {
+                init_logging(verbose);
+                if args.dry_run {
+                    anyhow::bail!("--dry-run is not supported for 'hack migrate-from sqlx convert'; omit it to run for real");
+                }
+                let root = require_root(args.root)?;
+                let client = connect(&db).await?;
+                let receipt = sqlx_import::convert(&client, &root)
+                    .await
+                    .map_err(fmt_sqlx_err)?;
+                if receipt.newly_converted == 0 {
+                    println!(
                     "Already converted ({} migration(s) already have headers). Nothing written.",
                     receipt.migrations.len(),
                 );
-            } else {
-                println!(
-                    "Converted {} migration(s). Receipt written to: {}",
-                    receipt.newly_converted,
-                    root.join(".kryzhen-import-receipt.json").display(),
-                );
-                println!("\nNext step: kryzhen hack migrate-from sqlx import");
+                } else {
+                    println!(
+                        "Converted {} migration(s). Receipt written to: {}",
+                        receipt.newly_converted,
+                        root.join(".kryzhen-import-receipt.json").display(),
+                    );
+                    println!("\nNext step: kryzhen hack migrate-from sqlx import");
+                }
             }
-        }
 
-        // ------------------------------------------------------------------ hack migrate-from sqlx import
-        Some(Cmd::Hack {
-            action:
-                HackCmd::MigrateFrom {
-                    source:
-                        MigrateFromCmd::Sqlx {
-                            phase: SqlxPhaseCmd::Import { db, verbose },
-                        },
-                },
-        }) => {
-            init_logging(verbose);
-            if args.dry_run {
-                anyhow::bail!("--dry-run is not supported for 'hack migrate-from sqlx import'; omit it to run for real");
-            }
-            let root = require_root(args.root)?;
-            let receipt_path = root.join(sqlx_import::RECEIPT_FILENAME);
-            let receipt = sqlx_import::read_receipt(&receipt_path).map_err(fmt_sqlx_err)?;
-            let migrations = file::load_dir(&root)?;
-            let client = connect(&db).await?;
-            let receipt = sqlx_import::import(&client, &receipt, &migrations)
-                .await
-                .map_err(fmt_sqlx_err)?;
-            if receipt.already_imported {
-                println!("Already imported (_sqlx_migrations not present). Nothing to do.");
-            } else {
-                println!(
+            // ------------------------------------------------------------------ hack migrate-from sqlx import
+            HackCmd::MigrateFrom {
+                source:
+                    MigrateFromCmd::Sqlx {
+                        phase: SqlxPhaseCmd::Import { db, verbose },
+                    },
+            } => {
+                init_logging(verbose);
+                if args.dry_run {
+                    anyhow::bail!("--dry-run is not supported for 'hack migrate-from sqlx import'; omit it to run for real");
+                }
+                let root = require_root(args.root)?;
+                let receipt_path = root.join(sqlx_import::RECEIPT_FILENAME);
+                let receipt = sqlx_import::read_receipt(&receipt_path).map_err(fmt_sqlx_err)?;
+                let migrations = file::load_dir(&root)?;
+                let client = connect(&db).await?;
+                let receipt = sqlx_import::import(&client, &receipt, &migrations)
+                    .await
+                    .map_err(fmt_sqlx_err)?;
+                if receipt.already_imported {
+                    println!("Already imported (_sqlx_migrations not present). Nothing to do.");
+                } else {
+                    println!(
                     "Imported {} migration(s) into mallard.applied_migrations. _sqlx_migrations dropped.",
                     receipt.migrations.len()
                 );
-                println!("\nYou can now use `kryzhen migrate` as normal.");
-            }
-        }
-
-        // ------------------------------------------------------------------ hack migrate-from sqlx all
-        Some(Cmd::Hack {
-            action:
-                HackCmd::MigrateFrom {
-                    source:
-                        MigrateFromCmd::Sqlx {
-                            phase: SqlxPhaseCmd::All { db, verbose },
-                        },
-                },
-        }) => {
-            init_logging(verbose);
-            if args.dry_run {
-                anyhow::bail!("--dry-run is not supported for 'hack migrate-from sqlx all'; omit it to run for real");
-            }
-            let root = require_root(args.root)?;
-            let client = connect(&db).await?;
-
-            print!("Phase 1/2 convert... ");
-            let r = sqlx_import::convert(&client, &root)
-                .await
-                .map_err(fmt_sqlx_err)?;
-            if r.newly_converted == 0 {
-                println!("already converted ({} migration(s)).", r.migrations.len());
-            } else {
-                println!("{} migration(s) converted.", r.newly_converted);
+                    println!("\nYou can now use `kryzhen migrate` as normal.");
+                }
             }
 
-            print!("Phase 2/2 import... ");
-            let receipt_path = root.join(sqlx_import::RECEIPT_FILENAME);
-            let receipt = sqlx_import::read_receipt(&receipt_path).map_err(fmt_sqlx_err)?;
-            let migrations = file::load_dir(&root)?;
-            let r = sqlx_import::import(&client, &receipt, &migrations)
-                .await
-                .map_err(fmt_sqlx_err)?;
-            if r.already_imported {
-                println!("already imported (_sqlx_migrations not present).");
-            } else {
-                println!(
-                    "{} migration(s) imported. _sqlx_migrations dropped.",
-                    r.migrations.len()
-                );
-            }
+            // ------------------------------------------------------------------ hack migrate-from sqlx all
+            HackCmd::MigrateFrom {
+                source:
+                    MigrateFromCmd::Sqlx {
+                        phase: SqlxPhaseCmd::All { db, verbose },
+                    },
+            } => {
+                init_logging(verbose);
+                if args.dry_run {
+                    anyhow::bail!("--dry-run is not supported for 'hack migrate-from sqlx all'; omit it to run for real");
+                }
+                let root = require_root(args.root)?;
+                let client = connect(&db).await?;
 
-            println!("\nDone. You can now use `kryzhen migrate` as normal.");
-        }
+                print!("Phase 1/2 convert... ");
+                let r = sqlx_import::convert(&client, &root)
+                    .await
+                    .map_err(fmt_sqlx_err)?;
+                if r.newly_converted == 0 {
+                    println!("already converted ({} migration(s)).", r.migrations.len());
+                } else {
+                    println!("{} migration(s) converted.", r.newly_converted);
+                }
+
+                print!("Phase 2/2 import... ");
+                let receipt_path = root.join(sqlx_import::RECEIPT_FILENAME);
+                let receipt = sqlx_import::read_receipt(&receipt_path).map_err(fmt_sqlx_err)?;
+                let migrations = file::load_dir(&root)?;
+                let r = sqlx_import::import(&client, &receipt, &migrations)
+                    .await
+                    .map_err(fmt_sqlx_err)?;
+                if r.already_imported {
+                    println!("already imported (_sqlx_migrations not present).");
+                } else {
+                    println!(
+                        "{} migration(s) imported. _sqlx_migrations dropped.",
+                        r.migrations.len()
+                    );
+                }
+
+                println!("\nDone. You can now use `kryzhen migrate` as normal.");
+            }
+        },
     }
 
     Ok(())

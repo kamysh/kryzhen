@@ -191,7 +191,9 @@ pub async fn convert(
     // Load existing receipt if present; treat it as authoritative for already-converted versions.
     let receipt_path = receipt_path(migrations_dir);
     let existing_receipt: Option<Receipt> = if receipt_path.exists() {
-        Some(serde_json::from_str(&std::fs::read_to_string(&receipt_path)?)?)
+        Some(serde_json::from_str(&std::fs::read_to_string(
+            &receipt_path,
+        )?)?)
     } else {
         None
     };
@@ -250,7 +252,9 @@ pub async fn convert(
                         match std::fs::read(&guessed_path) {
                             Ok(bytes) => {
                                 let guessed_hex = hex(&Sha384::digest(&bytes));
-                                format!("  guessed file:  {guessed}\n  its checksum:  {guessed_hex}")
+                                format!(
+                                    "  guessed file:  {guessed}\n  its checksum:  {guessed_hex}"
+                                )
                             }
                             Err(_) => format!("  guessed file:  {guessed} (does not exist)"),
                         }

@@ -13,9 +13,7 @@ pub fn parse_file(text: &str, file_label: &str) -> Result<Vec<Migration>> {
         message: msg,
     };
 
-    migration_file
-        .parse(text)
-        .map_err(|e| err(e.to_string()))
+    migration_file.parse(text).map_err(|e| err(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -141,11 +139,19 @@ fn migration(input: &mut &str) -> ModalResult<Migration> {
 
     let name = match get(&fields, "name") {
         Some(FieldValue::Single(s)) => MigrationName(s.clone()),
-        _ => return Err(winnow::error::ErrMode::Cut(winnow::error::ContextError::new())),
+        _ => {
+            return Err(winnow::error::ErrMode::Cut(
+                winnow::error::ContextError::new(),
+            ))
+        }
     };
     let description = match get(&fields, "description") {
         Some(FieldValue::Single(s)) => s.clone(),
-        _ => return Err(winnow::error::ErrMode::Cut(winnow::error::ContextError::new())),
+        _ => {
+            return Err(winnow::error::ErrMode::Cut(
+                winnow::error::ContextError::new(),
+            ))
+        }
     };
     let requires = match get(&fields, "requires") {
         None => vec![],
