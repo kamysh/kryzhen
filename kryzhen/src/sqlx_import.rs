@@ -51,8 +51,20 @@ pub struct Receipt {
 pub enum SqlxImportError {
     #[error("no receipt found at {path}; run `kryzhen hack migrate-from sqlx convert` first")]
     NoReceipt { path: PathBuf },
-    #[error("file not found: {path} (sqlx recorded migration {name:?} as applied)")]
-    FileMissing { path: PathBuf, name: String },
+    #[error(
+        "migration version {version} ({description:?}) has no matching file in {dir}\n\
+         \x20 sqlx checksum:  {sqlx_hex}\n\
+         {hint}"
+    )]
+    FileMissing {
+        version: i64,
+        description: String,
+        dir: PathBuf,
+        sqlx_hex: String,
+        /// Either "  guessed file:   <name>\n  its checksum:   <hex>"
+        /// or     "  guessed file:   <name> (does not exist)"
+        hint: String,
+    },
     #[error(
         "checksum mismatch for {filename}:\n  expected (sqlx): {expected}\n  got (disk):      {got}\nThe file differs from what sqlx applied."
     )]
@@ -176,7 +188,26 @@ pub async fn convert(
         )
         .await?;
 
+    // Load existing receipt if present; treat it as authoritative for already-converted versions.
+    let receipt_path = receipt_path(migrations_dir);
+    let existing_receipt: Option<Receipt> = if receipt_path.exists() {
+        Some(serde_json::from_str(&std::fs::read_to_string(&receipt_path)?)?)
+    } else {
+        None
+    };
+    let existing_by_version: std::collections::HashMap<i64, &ReceiptEntry> = existing_receipt
+        .as_ref()
+        .map(|r| r.migrations.iter().map(|e| (e.version, e)).collect())
+        .unwrap_or_default();
+
     let dir_files = collect_sql_files(migrations_dir)?;
+    // Pre-compute checksums for all files so we can match by content, not name.
+    let mut file_checksums: Vec<(String, Vec<u8>)> = Vec::new();
+    for fname in &dir_files {
+        let raw = std::fs::read(migrations_dir.join(fname))?;
+        file_checksums.push((fname.clone(), Sha384::digest(&raw).to_vec()));
+    }
+
     let names: Vec<String> = rows
         .iter()
         .map(|r| {
@@ -195,21 +226,52 @@ pub async fn convert(
         let sqlx_hex = hex(&sqlx_checksum);
         let kryzhen_name = names[i].clone();
 
-        let filename = find_file_for(&dir_files, &description, &kryzhen_name).ok_or_else(|| {
-            SqlxImportError::FileMissing {
-                path: migrations_dir.join(format!("<{description}>.sql")),
-                name: description.clone(),
+        // Case 1: migration already in the receipt — verify checksum and skip conversion.
+        if let Some(existing) = existing_by_version.get(&version) {
+            if existing.sqlx_checksum_hex != sqlx_hex {
+                return Err(SqlxImportError::ReceiptDbMismatch {
+                    name: existing.kryzhen_name.clone(),
+                    receipt_hex: existing.sqlx_checksum_hex.clone(),
+                    db_hex: sqlx_hex,
+                });
             }
-        })?;
+            entries.push((*existing).clone());
+            continue;
+        }
+
+        // Case 2: migration not in the receipt — find file by checksum, convert, add to receipt.
+        let filename = match file_checksums.iter().find(|(_, ck)| *ck == sqlx_checksum) {
+            Some((fname, _)) => fname.clone(),
+            None => {
+                // No checksum match. Try to guess the filename by name for diagnostics only.
+                let hint = match find_file_for(&dir_files, &description, &kryzhen_name) {
+                    Some(guessed) => {
+                        let guessed_path = migrations_dir.join(&guessed);
+                        match std::fs::read(&guessed_path) {
+                            Ok(bytes) => {
+                                let guessed_hex = hex(&Sha384::digest(&bytes));
+                                format!("  guessed file:  {guessed}\n  its checksum:  {guessed_hex}")
+                            }
+                            Err(_) => format!("  guessed file:  {guessed} (does not exist)"),
+                        }
+                    }
+                    None => "  no file name matches the migration description".to_string(),
+                };
+                return Err(SqlxImportError::FileMissing {
+                    version,
+                    description: description.clone(),
+                    dir: migrations_dir.to_owned(),
+                    sqlx_hex,
+                    hint,
+                });
+            }
+        };
 
         let full_path = migrations_dir.join(&filename);
-        let raw = std::fs::read(&full_path)?;
-        let file_hex = hex(&Sha384::digest(&raw));
-
-        // Only verify checksum against original (un-headered) file content.
-        // If the file already has a header, we trust the receipt instead.
         let content = std::fs::read_to_string(&full_path)?;
-        if !content.contains("-- #!migration") && file_hex != sqlx_hex {
+
+        let file_hex = hex(&Sha384::digest(content.as_bytes()));
+        if file_hex != sqlx_hex {
             return Err(SqlxImportError::ChecksumMismatch {
                 filename,
                 expected: sqlx_hex,
@@ -217,7 +279,7 @@ pub async fn convert(
             });
         }
 
-        // Rewrite file with header if not already converted.
+        // Rewrite file with header if not already present.
         if !content.contains("-- #!migration") {
             let (desc_text, body) = extract_description_and_body(&content);
             let requires: Vec<String> = if i > 0 {
