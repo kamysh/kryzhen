@@ -120,6 +120,22 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Like `try_consume(ch)` but does NOT call `skip_ws` after consuming.
+    /// Used for the header-terminating `;`: `skip_ws` treats `-` as whitespace
+    /// (so it can transparently skip `-- ` comment prefixes inside the header),
+    /// but past the terminator the `--` is the start of a SQL line comment in
+    /// the body. The post-consume `skip_ws` would strip it and turn the comment
+    /// text into bare SQL tokens.
+    fn try_consume_terminator(&mut self, ch: char) -> bool {
+        self.skip_ws();
+        if self.rest().starts_with(ch) {
+            self.pos += ch.len_utf8();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Parse a double-quoted string: any chars except `"`. Mirrors `noneOf "\""`.
     fn parse_quoted(&mut self, err: &impl Fn(String) -> Error) -> Result<String> {
         self.skip_ws();
@@ -202,12 +218,12 @@ fn parse_header_fields(
     let mut fields = Vec::new();
     loop {
         p.skip_ws();
-        if p.try_consume(';') {
+        if p.try_consume_terminator(';') {
             break;
         }
         if !fields.is_empty() {
             p.expect(',', err)?;
-            if p.try_consume(';') {
+            if p.try_consume_terminator(';') {
                 break;
             }
         }
@@ -386,6 +402,29 @@ SELECT 1;
             parse_file(text, "x.sql").unwrap_err(),
             Error::Parse { .. }
         ));
+    }
+
+    #[test]
+    fn body_preserves_leading_sql_comment() {
+        // Regression: pre-0.6.1, `skip_ws` after the header `;` ate the
+        // leading `--` of the next line (a SQL comment), so the body began
+        // with bare prose. PostgreSQL then parsed `Create the AGE graph...`
+        // as a CREATE statement followed by `the` and bailed with
+        // `syntax error at or near "the"`.
+        let text = concat!(
+            "-- #!migration\n",
+            "-- name: \"initial\",\n",
+            "-- description: \"sets up the graph\";\n",
+            "-- Create the AGE graph if it doesn't already exist.\n",
+            "SELECT 1;\n",
+        );
+        let m = parse_file(text, "001.sql").unwrap();
+        assert_eq!(m.len(), 1);
+        assert!(
+            m[0].script.starts_with("--"),
+            "body should preserve leading `--` comment, got: {:?}",
+            m[0].script
+        );
     }
 
     #[test]
