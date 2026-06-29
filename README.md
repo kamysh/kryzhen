@@ -65,6 +65,34 @@ kryzhen creates a `mallard` schema (if absent) with an `applied_migrations` tabl
 
 This is the same schema used by mallard, so the two tools can share a database.
 
+kryzhen also keeps a companion table `mallard.applied_migration_schemas` recording, per migration, which schema(s) it has been applied to (one row per `(migration_name, schema)`), and a `mallard.migrator_version` table marking the ledger format. See [Multiple schemas](#multiple-schemas-templated-migrations).
+
+---
+
+## Multiple schemas (templated migrations)
+
+The same migration set can be applied independently to many schemas — one schema per customer/tenant, or one per RAG corpus. Migrations act as **templates**:
+
+- **Unqualified** DDL (`CREATE TABLE widgets …`) is created in the **target schema** — kryzhen runs each migration body under `SET LOCAL search_path TO <schema>`.
+- **Schema-qualified** DDL (`CREATE TABLE other.thing …`) goes exactly where it names.
+
+Because the body runs with `search_path` set to the target schema only, a migration that references an object in *another* schema (e.g. an extension function) by an unqualified name will not resolve it — schema-qualify such references.
+
+Apply to a schema with `--schema` (library: the `schema` argument to `migrate`). It defaults to `public`, which reproduces single-schema behaviour. To roll the same migrations out to several schemas, run once per schema:
+
+```bash
+kryzhen --database app --schema customer_a migrations/
+kryzhen --database app --schema customer_b migrations/
+```
+
+Tracking is **per schema**: the `mallard.applied_migration_schemas` table records which migrations have reached which schema. Different schemas may sit at different points in the chain — onboarding a new customer applies the whole chain into a fresh schema, while adding a new migration only applies the missing tail to each existing schema. The canonical `mallard.applied_migrations` row (body + checksum) is written once, on the first schema to apply a given migration, and tamper detection is verified against it on every run (the body is schema-independent).
+
+> **Note:** the per-schema id uses `gen_random_uuid()`, which is built in on **PostgreSQL 13+**. On older servers, enable the `pgcrypto` extension.
+
+### Upgrading an existing database
+
+A database first migrated by an older kryzhen (no per-schema table) is upgraded automatically: on the next run, kryzhen creates the new tables and backfills an association for every already-applied migration against the schema the connection currently resolves to (`current_schema()` — where those objects actually live), then stamps `migrator_version`. Nothing is re-applied. This runs once and is idempotent.
+
 ---
 
 ## Tamper detection
@@ -96,7 +124,8 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move { let _ = conn.await; });
 
     let migrations = file::load_dir("migrations")?;
-    let report: Report = migrate(&mut client, &migrations, false).await?;
+    // Apply to the `public` schema; pass a different schema per tenant to template.
+    let report: Report = migrate(&mut client, &migrations, "public", false).await?;
 
     println!("Applied:         {:?}", report.applied);
     println!("Already applied: {:?}", report.already_applied);
@@ -132,6 +161,7 @@ kryzhen --database mydb [ROOT]
 | `--host <HOST>` | `127.0.0.1` | Server host. |
 | `--port <PORT>` | `5432` | Server port. |
 | `--user <USER>` | `postgres` | Username. |
+| `--schema <SCHEMA>` | `public` | Target schema for the migrations. See [Multiple schemas](#multiple-schemas-templated-migrations). |
 | `--password <PASSWORD>` | *(empty)* | Password. |
 | `--sslmode <MODE>` | `prefer` | TLS mode: `disable`, `prefer`, `require`, `verify-ca`, or `verify-full`. See [TLS](#tls). |
 | `--ssl-root-cert <PATH>` | *(none)* | CA certificate for `verify-ca` / `verify-full` (PEM). |
@@ -186,7 +216,7 @@ The `kryzhen hack` subcommand provides low-level manipulation of `mallard.applie
 kryzhen hack add <NAME> --root migrations/ --database mydb
 ```
 
-Inserts a row for `NAME` into `mallard.applied_migrations` without executing the SQL body. Useful when a migration has already been applied by other means (e.g. provisioned by Terraform, applied by another tool). Fails if any of the migration's `requires` are not yet applied.
+Records `NAME` as applied (to `--schema`, default `public`) without executing the SQL body. Useful when a migration has already been applied by other means (e.g. provisioned by Terraform, applied by another tool). Fails if any of the migration's `requires` are not yet applied **to that schema**.
 
 ### `hack delete` — remove a migration record without running any SQL
 
@@ -194,7 +224,7 @@ Inserts a row for `NAME` into `mallard.applied_migrations` without executing the
 kryzhen hack delete <NAME> --database mydb
 ```
 
-Removes the `NAME` row from `mallard.applied_migrations`. Fails if any currently-applied migration lists `NAME` in its `requires`.
+Removes `NAME`'s association with `--schema` (default `public`) from `mallard.applied_migration_schemas`. Fails if any migration applied to that schema lists `NAME` in its `requires`. When that was `NAME`'s last remaining schema, the canonical `mallard.applied_migrations` row is also removed.
 
 ### `hack fix-checksum` — update a stored checksum to match the current file
 

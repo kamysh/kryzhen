@@ -329,7 +329,7 @@ pub async fn convert(
 /// Fails if `_sqlx_migrations` does not match the receipt (wrong machine,
 /// wrong DB, or DB not migrated with sqlx yet).
 pub async fn import(
-    client: &impl GenericClient,
+    client: &mut impl GenericClient,
     receipt: &Receipt,
     migrations: &[Migration],
 ) -> std::result::Result<Receipt, SqlxImportError> {
@@ -410,6 +410,13 @@ pub async fn import(
     crate::postgres::ensure_schema(client).await?;
     let already_applied = crate::postgres::load_applied(client).await?;
 
+    // sqlx applied its migrations to whatever schema this connection resolves to; record
+    // the association against that same schema (current_schema()), not a hardcoded literal.
+    let target_schema: String = client
+        .query_one("SELECT current_schema()", &[])
+        .await?
+        .get(0);
+
     let applied_names: Vec<String> = applied_entries
         .iter()
         .map(|e| e.kryzhen_name.clone())
@@ -437,26 +444,23 @@ pub async fn import(
             entry.sqlx_description.clone()
         };
 
-        let requires: Vec<String> = if i > 0 {
-            vec![applied_names[i - 1].clone()]
+        let requires: Vec<MigrationName> = if i > 0 {
+            vec![MigrationName(applied_names[i - 1].clone())]
         } else {
             vec![]
         };
 
-        client
-            .execute(
-                "INSERT INTO mallard.applied_migrations \
-                 (name, description, requires, checksum, script_text) \
-                 VALUES ($1, $2, $3, $4, $5)",
-                &[
-                    &entry.kryzhen_name,
-                    &description,
-                    &requires,
-                    &migration.checksum.as_slice(),
-                    &migration.script,
-                ],
-            )
-            .await?;
+        // The recorded migration carries sqlx's description and the reconstructed linear
+        // requires chain, but the on-disk body/checksum. Routing through record_applied
+        // commits the canonical row and the (name, schema) association in one transaction.
+        let recorded = Migration {
+            name: mname,
+            description,
+            requires,
+            script: migration.script.clone(),
+            checksum: migration.checksum,
+        };
+        crate::postgres::record_applied(client, &recorded, &target_schema).await?;
     }
 
     client

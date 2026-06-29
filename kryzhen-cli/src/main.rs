@@ -123,6 +123,11 @@ struct DbArgs {
     port: u16,
     #[arg(long, global = true, default_value = "postgres")]
     user: String,
+    /// Target schema for the migrations. Migrations are templates: unqualified DDL is
+    /// created in this schema (via search_path). Apply to several schemas by running
+    /// once per schema. Defaults to `public`.
+    #[arg(long, global = true, default_value = "public")]
+    schema: String,
     /// TLS mode: disable, prefer, require.
     #[arg(long, global = true, default_value = "prefer", value_parser = parse_sslmode)]
     sslmode: SslMode,
@@ -271,6 +276,21 @@ fn require_root(root: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     root.ok_or_else(|| anyhow::anyhow!("--root is required"))
 }
 
+/// Reject `--schema` on subcommands that do not act on a single target schema, so the
+/// global flag is never silently ignored. `hack fix-checksum` touches the
+/// schema-independent canonical row; `hack migrate-from sqlx` records against the
+/// connection's own `current_schema()`. Neither honours an override.
+fn reject_schema_override(db: &DbArgs, subcommand: &str) -> anyhow::Result<()> {
+    if db.schema != kryzhen::DEFAULT_SCHEMA {
+        anyhow::bail!(
+            "--schema is not supported for '{subcommand}' (it does not target a single schema); \
+             remove --schema (the default {:?} is implied)",
+            kryzhen::DEFAULT_SCHEMA,
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -298,7 +318,8 @@ async fn main() -> anyhow::Result<()> {
             let root = require_root(args.root)?;
             let client = connect(&args.db).await?;
             let migrations = file::load_dir(&root)?;
-            let report = migrate(&mut { client }, &migrations, args.dry_run).await?;
+            let report =
+                migrate(&mut { client }, &migrations, &args.db.schema, args.dry_run).await?;
             if args.dry_run {
                 if report.applied.is_empty() {
                     println!("Nothing to apply.");
@@ -328,27 +349,31 @@ async fn main() -> anyhow::Result<()> {
             HackCmd::Add { name, db, verbose } => {
                 init_logging(verbose);
                 let root = require_root(args.root)?;
-                let client = connect(&db).await?;
+                let mut client = connect(&db).await?;
                 let migrations = file::load_dir(&root)?;
-                hack_add(&client, &migrations, &name)
+                hack_add(&mut client, &migrations, &name, &db.schema)
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                println!("Recorded {name:?} as applied.");
+                println!("Recorded {name:?} as applied to schema {:?}.", db.schema);
             }
 
             // ------------------------------------------------------------------ hack delete
             HackCmd::Delete { name, db, verbose } => {
                 init_logging(verbose);
-                let client = connect(&db).await?;
-                hack_delete(&client, &name)
+                let mut client = connect(&db).await?;
+                hack_delete(&mut client, &name, &db.schema)
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                println!("Removed {name:?} from applied_migrations.");
+                println!(
+                    "Removed {name:?} from schema {:?} in applied_migrations.",
+                    db.schema
+                );
             }
 
             // ------------------------------------------------------------------ hack fix-checksum
             HackCmd::FixChecksum { name, db, verbose } => {
                 init_logging(verbose);
+                reject_schema_override(&db, "hack fix-checksum")?;
                 let root = require_root(args.root)?;
                 let client = connect(&db).await?;
                 let migrations = file::load_dir(&root)?;
@@ -366,6 +391,7 @@ async fn main() -> anyhow::Result<()> {
                     },
             } => {
                 init_logging(verbose);
+                reject_schema_override(&db, "hack migrate-from sqlx convert")?;
                 if args.dry_run {
                     anyhow::bail!("--dry-run is not supported for 'hack migrate-from sqlx convert'; omit it to run for real");
                 }
@@ -397,6 +423,7 @@ async fn main() -> anyhow::Result<()> {
                     },
             } => {
                 init_logging(verbose);
+                reject_schema_override(&db, "hack migrate-from sqlx import")?;
                 if args.dry_run {
                     anyhow::bail!("--dry-run is not supported for 'hack migrate-from sqlx import'; omit it to run for real");
                 }
@@ -404,8 +431,8 @@ async fn main() -> anyhow::Result<()> {
                 let receipt_path = root.join(sqlx_import::RECEIPT_FILENAME);
                 let receipt = sqlx_import::read_receipt(&receipt_path).map_err(fmt_sqlx_err)?;
                 let migrations = file::load_dir(&root)?;
-                let client = connect(&db).await?;
-                let receipt = sqlx_import::import(&client, &receipt, &migrations)
+                let mut client = connect(&db).await?;
+                let receipt = sqlx_import::import(&mut client, &receipt, &migrations)
                     .await
                     .map_err(fmt_sqlx_err)?;
                 if receipt.already_imported {
@@ -427,11 +454,12 @@ async fn main() -> anyhow::Result<()> {
                     },
             } => {
                 init_logging(verbose);
+                reject_schema_override(&db, "hack migrate-from sqlx all")?;
                 if args.dry_run {
                     anyhow::bail!("--dry-run is not supported for 'hack migrate-from sqlx all'; omit it to run for real");
                 }
                 let root = require_root(args.root)?;
-                let client = connect(&db).await?;
+                let mut client = connect(&db).await?;
 
                 print!("Phase 1/2 convert... ");
                 let r = sqlx_import::convert(&client, &root)
@@ -447,7 +475,7 @@ async fn main() -> anyhow::Result<()> {
                 let receipt_path = root.join(sqlx_import::RECEIPT_FILENAME);
                 let receipt = sqlx_import::read_receipt(&receipt_path).map_err(fmt_sqlx_err)?;
                 let migrations = file::load_dir(&root)?;
-                let r = sqlx_import::import(&client, &receipt, &migrations)
+                let r = sqlx_import::import(&mut client, &receipt, &migrations)
                     .await
                     .map_err(fmt_sqlx_err)?;
                 if r.already_imported {

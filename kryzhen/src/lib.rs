@@ -39,7 +39,8 @@
 //! tokio::spawn(async move { let _ = conn.await; });
 //!
 //! let migrations = file::load_dir(std::path::Path::new("migrations"))?;
-//! let report: Report = migrate(&mut client, &migrations, false).await?;
+//! // Apply to the `public` schema. Pass a different schema per customer to template.
+//! let report: Report = migrate(&mut client, &migrations, "public", false).await?;
 //! println!("applied {} migration(s)", report.applied.len());
 //! # Ok(())
 //! # }
@@ -67,6 +68,7 @@ pub mod sqlx_import;
 pub mod types;
 pub mod validation;
 
+pub use postgres::DEFAULT_SCHEMA;
 pub use types::{checksum, Error, Migration, MigrationName};
 
 /// Library result type — `Result<T, `[`Error`]`>`.
@@ -103,53 +105,67 @@ pub struct Report {
 use std::collections::HashMap;
 use tokio_postgres::GenericClient;
 
-/// Run all pending migrations against the supplied database connection.
+/// Run all pending migrations against `schema` on the supplied database connection.
 ///
 /// `migrations` must be pre-loaded by the caller (e.g. via [`file::load_dir`]).
 /// The function validates names, topologically sorts by `requires`, ensures the
-/// `mallard.applied_migrations` table exists, verifies checksums of already-applied
-/// migrations, then applies each pending migration in dependency order inside its own
-/// transaction.
+/// `mallard` tracking tables exist, verifies checksums of already-applied migrations,
+/// then applies each migration not yet applied to `schema`, in dependency order, inside
+/// its own transaction.
+///
+/// The same migration set can be applied to multiple schemas by calling `migrate` once
+/// per schema: migrations are templates, and each pending migration's body runs under
+/// `SET LOCAL search_path TO <schema>`, so unqualified DDL lands in `schema` while
+/// schema-qualified DDL goes where it names. Pass [`postgres::DEFAULT_SCHEMA`] (`public`)
+/// to reproduce single-schema behaviour.
+///
+/// The skip-set is per-schema: a migration already applied to another schema is still
+/// applied to `schema` if missing there (schemas may sit at different points in the
+/// chain). Checksum/tamper detection is schema-independent (the body is the same).
 ///
 /// When `dry_run` is `true`, nothing is applied; the function still connects and
 /// verifies checksums.
 pub async fn migrate(
     client: &mut impl GenericClient,
     migrations: &[Migration],
+    schema: &str,
     dry_run: bool,
 ) -> Result<Report> {
     validation::check_duplicate_names(migrations)?;
     let ordered = graph::topo_sort(migrations.to_vec())?;
 
     postgres::ensure_schema(client).await?;
-    let applied: HashMap<MigrationName, [u8; 32]> = postgres::load_applied(client).await?;
-    validation::check_checksums(&ordered, &applied)?;
+    let checksums: HashMap<MigrationName, [u8; 32]> = postgres::load_applied(client).await?;
+    validation::check_checksums(&ordered, &checksums)?;
+    let applied_here = postgres::load_applied_for_schema(client, schema).await?;
 
     let mut report = Report::default();
     for m in &ordered {
-        if applied.contains_key(&m.name) {
+        if applied_here.contains(&m.name) {
             report.already_applied.push(m.name.0.clone());
             continue;
         }
         if !dry_run {
-            postgres::apply_one(client, m).await?;
+            postgres::apply_one(client, m, schema).await?;
         }
         report.applied.push(m.name.0.clone());
     }
     Ok(report)
 }
 
-/// Record a migration as applied without running its SQL.
+/// Record a migration as applied to `schema` without running its SQL.
 ///
-/// Looks up `name` in `migrations`, checks that all its `requires` are already
-/// present in `mallard.applied_migrations`, then inserts the record.
+/// Looks up `name` in `migrations`, checks that all its `requires` are already applied
+/// **to `schema`**, then inserts the canonical row (if absent) and the `(name, schema)`
+/// association row.
 ///
-/// Returns [`HackError::UnsatisfiedRequires`] if any dependency is not yet applied,
-/// or [`HackError::NotFound`] if `name` is not in `migrations`.
+/// Returns [`HackError::UnsatisfiedRequires`] if any dependency is not yet applied to
+/// `schema`, or [`HackError::NotFound`] if `name` is not in `migrations`.
 pub async fn hack_add(
-    client: &impl GenericClient,
+    client: &mut impl GenericClient,
     migrations: &[Migration],
     name: &str,
+    schema: &str,
 ) -> std::result::Result<(), HackError> {
     let m = migrations
         .iter()
@@ -157,10 +173,10 @@ pub async fn hack_add(
         .ok_or_else(|| HackError::NotFound(name.to_string()))?;
 
     postgres::ensure_schema(client).await?;
-    let applied = postgres::load_applied(client).await?;
+    let applied_here = postgres::load_applied_for_schema(client, schema).await?;
 
     for req in &m.requires {
-        if !applied.contains_key(req) {
+        if !applied_here.contains(req) {
             return Err(HackError::UnsatisfiedRequires {
                 name: name.to_string(),
                 missing: req.0.clone(),
@@ -168,7 +184,7 @@ pub async fn hack_add(
         }
     }
 
-    postgres::record_applied(client, m).await?;
+    postgres::record_applied(client, m, schema).await?;
     Ok(())
 }
 
@@ -198,17 +214,20 @@ pub async fn hack_fix_checksum(
     Ok(())
 }
 
-/// Remove a migration record without running any SQL.
+/// Remove a migration's association with `schema` without running any SQL.
 ///
-/// Checks that no currently-applied migration lists `name` in its `requires`.
-/// Returns [`HackError::HasDependents`] if any dependents exist.
+/// Checks that no migration applied **to `schema`** lists `name` in its `requires`.
+/// Returns [`HackError::HasDependents`] if any dependents exist. When `schema` was the
+/// migration's last remaining schema, the canonical `applied_migrations` row is also
+/// dropped (see [`postgres::remove_applied`]).
 pub async fn hack_delete(
-    client: &impl GenericClient,
+    client: &mut impl GenericClient,
     name: &str,
+    schema: &str,
 ) -> std::result::Result<(), HackError> {
     postgres::ensure_schema(client).await?;
 
-    let applied_with_requires = postgres::load_applied_with_requires(client).await?;
+    let applied_with_requires = postgres::load_applied_with_requires(client, schema).await?;
     let target = MigrationName(name.to_string());
 
     let dependents: Vec<String> = applied_with_requires
@@ -224,6 +243,6 @@ pub async fn hack_delete(
         });
     }
 
-    postgres::remove_applied(client, &target).await?;
+    postgres::remove_applied(client, &target, schema).await?;
     Ok(())
 }
