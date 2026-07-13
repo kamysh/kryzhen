@@ -41,7 +41,8 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
-      contents: write
+      contents: write   # publish the release + assets
+      actions: write    # delete superseded Actions artifacts (prune step)
 
     steps:
       - uses: actions/download-artifact@v4
@@ -52,3 +53,22 @@ jobs:
             kryzhen-linux-amd64/kryzhen-linux-amd64
             kryzhen-linux-arm64/kryzhen-linux-arm64
             kryzhen-darwin-arm64/kryzhen-darwin-arm64
+
+      # Keep only THIS release's per-platform binaries as Actions artifacts.
+      # The distributable binaries live on the GitHub Release (published above)
+      # and on Release assets uploaded separately (e.g. darwin-amd64) — those
+      # are NOT Actions artifacts and are untouched here. This step deletes
+      # every Actions artifact from a PRIOR run, so exactly one latest binary
+      # per platform remains and Actions storage does not grow unbounded.
+      - name: Prune superseded Actions artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Keeping artifacts from run ${{ github.run_id }}; deleting older ones."
+          gh api --paginate \
+            "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.workflow_run.id != ${{ github.run_id }}) | .id' \
+          | while read -r id; do
+              echo "Deleting artifact $id"
+              gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id"
+            done
