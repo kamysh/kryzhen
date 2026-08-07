@@ -39,8 +39,10 @@
 //! tokio::spawn(async move { let _ = conn.await; });
 //!
 //! let migrations = file::load_dir(std::path::Path::new("migrations"))?;
-//! // Apply to the `public` schema. Pass a different schema per customer to template.
-//! let report: Report = migrate(&mut client, &migrations, "public", false).await?;
+//! // `None` targets the connection's current_schema() (the first entry in its
+//! // search_path — `public` unless configured otherwise). Pass `Some("schema")` to
+//! // target a specific schema, e.g. a different one per customer to template.
+//! let report: Report = migrate(&mut client, &migrations, None, false).await?;
 //! println!("applied {} migration(s)", report.applied.len());
 //! # Ok(())
 //! # }
@@ -116,8 +118,12 @@ use tokio_postgres::GenericClient;
 /// The same migration set can be applied to multiple schemas by calling `migrate` once
 /// per schema: migrations are templates, and each pending migration's body runs under
 /// `SET LOCAL search_path TO <schema>`, so unqualified DDL lands in `schema` while
-/// schema-qualified DDL goes where it names. Pass [`postgres::DEFAULT_SCHEMA`] (`public`)
-/// to reproduce single-schema behaviour.
+/// schema-qualified DDL goes where it names.
+///
+/// Pass `Some(name)` to target a specific schema. Pass `None` to target the connection's
+/// `current_schema()` (the first entry in its `search_path`) — this keeps the default
+/// consistent with the upgrade backfill and sqlx import, which record against
+/// `current_schema()`, and respects a non-`public` `search_path`.
 ///
 /// The skip-set is per-schema: a migration already applied to another schema is still
 /// applied to `schema` if missing there (schemas may sit at different points in the
@@ -128,16 +134,28 @@ use tokio_postgres::GenericClient;
 pub async fn migrate(
     client: &mut impl GenericClient,
     migrations: &[Migration],
-    schema: &str,
+    schema: Option<&str>,
     dry_run: bool,
 ) -> Result<Report> {
     validation::check_duplicate_names(migrations)?;
     let ordered = graph::topo_sort(migrations.to_vec())?;
 
     postgres::ensure_schema(client).await?;
+
+    // Resolve the target: an explicit schema, or the connection's current_schema() when
+    // unspecified (matching the backfill/import paths, so an unspecified schema always
+    // means "wherever this connection's search_path points").
+    let schema: String = match schema {
+        Some(s) => s.to_string(),
+        None => client
+            .query_one("SELECT current_schema()", &[])
+            .await?
+            .get(0),
+    };
+
     let checksums: HashMap<MigrationName, [u8; 32]> = postgres::load_applied(client).await?;
     validation::check_checksums(&ordered, &checksums)?;
-    let applied_here = postgres::load_applied_for_schema(client, schema).await?;
+    let applied_here = postgres::load_applied_for_schema(client, &schema).await?;
 
     let mut report = Report::default();
     for m in &ordered {
@@ -146,7 +164,7 @@ pub async fn migrate(
             continue;
         }
         if !dry_run {
-            postgres::apply_one(client, m, schema).await?;
+            postgres::apply_one(client, m, &schema).await?;
         }
         report.applied.push(m.name.0.clone());
     }

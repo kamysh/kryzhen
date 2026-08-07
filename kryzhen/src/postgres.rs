@@ -17,12 +17,29 @@
 //!
 //! Two tables track state inside the `mallard` schema:
 //! - `mallard.applied_migrations` — one row per migration *name*; holds the canonical
-//!   body + checksum (schema-independent, so verified once). Upstream-mallard-shaped.
+//!   body + checksum (schema-independent, so verified once). Byte-for-byte mallard's own
+//!   shape (no kryzhen-only columns).
 //! - `mallard.applied_migration_schemas` — one row per (migration, schema); the per-schema
 //!   skip-set. Sparse: different schemas may sit at different points in the chain.
 //!
-//! A `mallard.migrator_version` table records the ledger-format version and drives a
-//! one-time soft upgrade of pre-multi-schema databases (see [`ensure_schema`]).
+//! ## Self-migration (mirrors mallard's own bootstrap)
+//!
+//! `mallard.migrator_version` is not kryzhen's table to redefine — it is mallard's *own*
+//! self-migration ledger, and stock mallard already uses it to bring itself up via two
+//! embedded scripts, versions 0 and 1 (`sql/mallard/0000-setup.sql` creates the `mallard`
+//! schema and `migrator_version` itself; `0001-applied-migrations.sql` creates
+//! `applied_migrations`, exactly as shipped upstream — see [`SELF_MIGRATIONS`]). kryzhen
+//! applies those two verbatim, then layers its own version 2
+//! (`0002-multi-schema-tracking.sql`) on top, which retrofits the `UNIQUE(name)` index and
+//! creates `applied_migration_schemas`. [`ensure_schema`] runs whichever of the three are
+//! still missing, recorded as ordinary rows in `mallard.migrator_version` — the same table
+//! and the same mechanism real mallard uses for its own two, so kryzhen can extend a
+//! database a stock mallard already manages without touching mallard's own rows.
+//!
+//! An earlier kryzhen (pre-dating this scheme) stamped a meaningless one-row
+//! `(singleton boolean, version bigint)` table under this same name; [`ensure_schema`]
+//! detects and replaces it (see the module-private legacy-migration helper) before
+//! computing the current version.
 
 use crate::types::{Migration, MigrationName};
 use crate::Result;
@@ -33,53 +50,32 @@ use tokio_postgres::GenericClient;
 /// Matches plain libpq behaviour where unqualified objects land in `public`.
 pub const DEFAULT_SCHEMA: &str = "public";
 
-/// Ledger-format version stamped once the per-schema association table exists and has
-/// been backfilled. Pre-multi-schema databases report 0 (no `migrator_version` row).
-const MULTI_SCHEMA_VERSION: i64 = 1;
+/// kryzhen's self-migrations, applied in order by [`ensure_schema`] and recorded one row
+/// per version in `mallard.migrator_version` — the same ledger and mechanism stock
+/// mallard uses for its own bootstrap.
+///
+/// Versions 0 and 1 are mallard's own scripts, embedded byte-for-byte from upstream:
+/// pointed at a database a real mallard already manages, both are already satisfied (the
+/// ledger already has those rows) and only version 2 — kryzhen's own addition — applies.
+const SELF_MIGRATIONS: [(i64, &str); 3] = [
+    (0, include_str!("../sql/mallard/0000-setup.sql")),
+    (
+        1,
+        include_str!("../sql/mallard/0001-applied-migrations.sql"),
+    ),
+    (
+        2,
+        include_str!("../sql/mallard/0002-multi-schema-tracking.sql"),
+    ),
+];
 
-const ENSURE_SCHEMA: &str = "CREATE SCHEMA IF NOT EXISTS mallard";
-
-const ENSURE_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS mallard.applied_migrations( \
-    id           bigserial    NOT NULL, \
-    name         text         NOT NULL, \
-    description  text         NOT NULL, \
-    requires     text[]       NOT NULL, \
-    checksum     bytea        NOT NULL, \
-    script_text  text         NOT NULL, \
-    applied_on   timestamptz  NOT NULL DEFAULT now(), \
-    PRIMARY KEY (id) \
-)";
-
-// The unique constraint on `name` is created as a separate index rather than inline in
-// ENSURE_TABLE: `CREATE TABLE IF NOT EXISTS` is a no-op on a pre-existing table, so an
-// inline `UNIQUE (name)` would never be added to databases created by an earlier kryzhen
-// (which had only `PRIMARY KEY (id)`). `ON CONFLICT (name)` requires this index to exist,
-// so it must be retrofitted on every run. `CREATE UNIQUE INDEX IF NOT EXISTS` is idempotent
-// and applies equally to new and pre-existing tables.
-const ENSURE_NAME_UNIQUE: &str = "CREATE UNIQUE INDEX IF NOT EXISTS applied_migrations_name_key \
-     ON mallard.applied_migrations (name)";
-
-const ENSURE_SCHEMAS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS mallard.applied_migration_schemas( \
-    id              uuid         NOT NULL DEFAULT gen_random_uuid(), \
-    migration_name  text         NOT NULL, \
-    schema          text         NOT NULL, \
-    applied_on      timestamptz  NOT NULL DEFAULT now(), \
-    PRIMARY KEY (id), \
-    UNIQUE (migration_name, schema) \
-)";
-
-// Single-row version table: the `singleton` boolean is a fixed primary key constrained to
-// `true`, so at most one row can ever exist. This makes the version stamp an idempotent
-// upsert (`ON CONFLICT (singleton)`), safe under concurrent first-run upgrades — no
-// duplicate rows, no separate read-then-write race.
-const ENSURE_VERSION_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS mallard.migrator_version( \
-    singleton  boolean  NOT NULL DEFAULT true, \
-    version    bigint   NOT NULL, \
-    PRIMARY KEY (singleton), \
-    CHECK (singleton) \
+/// mallard's real `migrator_version` shape: one row per version reached, no upsert —
+/// matches upstream's `sql/mallard/0000-setup.sql` exactly.
+const CREATE_MIGRATOR_VERSION_TABLE: &str = "\
+CREATE TABLE mallard.migrator_version( \
+    version     bigint       NOT NULL, \
+    applied_on  timestamptz  NOT NULL DEFAULT now(), \
+    PRIMARY KEY (version) \
 )";
 
 const INSERT_CANONICAL: &str = "\
@@ -93,51 +89,155 @@ INSERT INTO mallard.applied_migration_schemas (migration_name, schema) \
     VALUES ($1, $2) \
     ON CONFLICT (migration_name, schema) DO NOTHING";
 
-/// Create the mallard schema, the canonical tracking table (with its retrofitted unique
-/// index on `name`), the per-schema association table, and the version table — then run
-/// the one-time soft upgrade if needed.
-///
-/// **Soft upgrade.** A database created by a pre-multi-schema kryzhen has rows in
-/// `mallard.applied_migrations` but no association table. Without bookkeeping, the new
-/// code would see an empty per-schema set, conclude every migration is unapplied, and
-/// re-run them — failing with `relation already exists`. To prevent that, when the
-/// stored ledger version is below [`MULTI_SCHEMA_VERSION`] we backfill an association row
-/// for every existing canonical migration against the schema this connection resolves to
-/// (`current_schema()` — where those objects actually live for this connection), then
-/// stamp the version. The backfill is idempotent and the version stamp runs at most once.
-pub async fn ensure_schema(client: &impl GenericClient) -> Result<()> {
-    client.batch_execute(ENSURE_SCHEMA).await?;
-    client.batch_execute(ENSURE_TABLE).await?;
-    client.batch_execute(ENSURE_NAME_UNIQUE).await?;
-    client.batch_execute(ENSURE_SCHEMAS_TABLE).await?;
-    client.batch_execute(ENSURE_VERSION_TABLE).await?;
-
-    let version: i64 = client
-        .query_one(
-            "SELECT coalesce(max(version), 0) FROM mallard.migrator_version",
-            &[],
+/// True if `schema.table` exists (safe to call before `schema` itself exists).
+async fn table_exists(client: &impl GenericClient, schema: &str, table: &str) -> Result<bool> {
+    let row = client
+        .query_opt(
+            "SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = $1 AND table_name = $2",
+            &[&schema, &table],
         )
+        .await?;
+    Ok(row.is_some())
+}
+
+/// True if `schema.table` has a column named `column`.
+async fn column_exists(
+    client: &impl GenericClient,
+    schema: &str,
+    table: &str,
+    column: &str,
+) -> Result<bool> {
+    let row = client
+        .query_opt(
+            "SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = $1 AND table_name = $2 AND column_name = $3",
+            &[&schema, &table, &column],
+        )
+        .await?;
+    Ok(row.is_some())
+}
+
+/// Replace an earlier kryzhen's meaningless `(singleton boolean, version bigint)`
+/// `mallard.migrator_version` with mallard's real shape.
+///
+/// That legacy table only ever recorded one thing — its own `MULTI_SCHEMA_VERSION = 1` —
+/// stamped once `applied_migrations` had its `UNIQUE(name)` index and
+/// `applied_migration_schemas` existed. That is exactly the combined effect of
+/// [`SELF_MIGRATIONS`] 0 through 2, so a database with the legacy table already satisfies
+/// all three; replace it and stamp them all as reached rather than re-running anything.
+async fn migrate_legacy_migrator_version(client: &mut impl GenericClient) -> Result<()> {
+    if !column_exists(client, "mallard", "migrator_version", "singleton").await? {
+        return Ok(());
+    }
+    let tx = client.transaction().await?;
+    tx.batch_execute("DROP TABLE mallard.migrator_version")
+        .await?;
+    tx.batch_execute(CREATE_MIGRATOR_VERSION_TABLE).await?;
+    for (v, _) in SELF_MIGRATIONS {
+        tx.execute(
+            "INSERT INTO mallard.migrator_version (version) VALUES ($1)",
+            &[&v],
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The highest [`SELF_MIGRATIONS`] version already reached, or -1 if none has.
+///
+/// A database with no ledger yet but an existing `applied_migrations` table was created
+/// by a pre-ledger kryzhen, whose `applied_migrations` shape has always matched mallard's
+/// real one — i.e. versions 0 and 1 are already satisfied. Their `CREATE SCHEMA` /
+/// `CREATE TABLE applied_migrations` cannot be replayed (both already exist), so create
+/// just the ledger table and stamp 0 and 1 directly.
+async fn current_self_migration_version(client: &mut impl GenericClient) -> Result<i64> {
+    if table_exists(client, "mallard", "migrator_version").await? {
+        let row = client
+            .query_opt("SELECT max(version) FROM mallard.migrator_version", &[])
+            .await?;
+        let version: Option<i64> = row.and_then(|r| r.get(0));
+        return Ok(version.unwrap_or(-1));
+    }
+
+    if table_exists(client, "mallard", "applied_migrations").await? {
+        client.batch_execute(CREATE_MIGRATOR_VERSION_TABLE).await?;
+        client
+            .batch_execute("INSERT INTO mallard.migrator_version (version) VALUES (0), (1)")
+            .await?;
+        return Ok(1);
+    }
+
+    Ok(-1)
+}
+
+/// Bring `mallard.migrator_version`, `mallard.applied_migrations` and
+/// `mallard.applied_migration_schemas` up to date by running whichever of
+/// [`SELF_MIGRATIONS`] are still missing, each in its own transaction alongside its
+/// version stamp — mirroring how mallard applies its own two self-migrations.
+///
+/// Handles three starting states: a totally fresh database (all three run); one created
+/// by a pre-ledger kryzhen (0 and 1 are backfilled, only 2 actually runs); and one
+/// created by an earlier kryzhen's meaningless legacy ledger (all three backfilled, see
+/// [`migrate_legacy_migrator_version`]). Pointed at a database a real stock mallard
+/// already manages, 0 and 1 are already in its own ledger and only kryzhen's own 2 runs.
+pub async fn ensure_schema(client: &mut impl GenericClient) -> Result<()> {
+    // Self-migrations 0/1 are mallard's own scripts and set search_path non-locally
+    // (matching upstream byte-for-byte); restore the caller's own default afterward so
+    // this call has no lingering effect on a long-lived connection's session state.
+    //
+    // `current_schema()` alone is NOT enough to restore from: it is only the first
+    // *resolvable* entry of search_path (e.g. a connection configured with
+    // `ag_catalog, "$user", public` reports current_schema() = "ag_catalog"), so
+    // restoring via `SET search_path TO <that one schema>` would silently narrow a
+    // multi-entry search_path down to one. Capture the raw setting via `SHOW` and
+    // restore that verbatim; `current_schema()` is still what per-schema backfill below
+    // records against (the schema these pre-existing rows actually resolve to).
+    let original_schema: String = client
+        .query_one("SELECT current_schema()", &[])
         .await?
         .get(0);
+    let original_search_path: String = client.query_one("SHOW search_path", &[]).await?.get(0);
 
-    if version < MULTI_SCHEMA_VERSION {
-        // Existing migrations were applied to whatever schema this connection resolves to;
-        // record that schema (current_schema()), not a hardcoded literal, so the backfill
-        // is accurate for a non-`public` default search_path too.
+    migrate_legacy_migrator_version(client).await?;
+    let version_before = current_self_migration_version(client).await?;
+    let mut version = version_before;
+
+    for (v, script) in SELF_MIGRATIONS {
+        if v <= version {
+            continue;
+        }
+        let tx = client.transaction().await?;
+        tx.batch_execute(script).await?;
+        tx.execute(
+            "INSERT INTO mallard.migrator_version (version) VALUES ($1)",
+            &[&v],
+        )
+        .await?;
+        tx.commit().await?;
+        version = v;
+    }
+
+    client
+        .batch_execute(&format!("SET search_path TO {original_search_path}"))
+        .await?;
+
+    // One-time backfill, run only when self-migration 2 (applied_migration_schemas) was
+    // just now newly reached in this call — never on a call that finds it already applied,
+    // or its association rows would gain a stray entry for whatever schema this
+    // particular connection happens to resolve to on every subsequent call. Covers a
+    // pre-ledger/legacy kryzhen's existing rows and, extending a real stock-mallard
+    // database, mallard's own pre-existing rows (it never tracked schemas at all) —
+    // against the schema this connection resolves to.
+    let (last_version, _) = SELF_MIGRATIONS[SELF_MIGRATIONS.len() - 1];
+    if version_before < last_version {
         client
             .execute(
                 "INSERT INTO mallard.applied_migration_schemas (migration_name, schema) \
-                 SELECT name, current_schema() FROM mallard.applied_migrations \
+                 SELECT name, $1 FROM mallard.applied_migrations \
                  ON CONFLICT (migration_name, schema) DO NOTHING",
-                &[],
-            )
-            .await?;
-        client
-            .execute(
-                "INSERT INTO mallard.migrator_version (version) VALUES ($1) \
-                 ON CONFLICT (singleton) DO UPDATE SET version = excluded.version \
-                 WHERE mallard.migrator_version.version < excluded.version",
-                &[&MULTI_SCHEMA_VERSION],
+                &[&original_schema],
             )
             .await?;
     }

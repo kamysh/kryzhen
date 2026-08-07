@@ -125,9 +125,10 @@ struct DbArgs {
     user: String,
     /// Target schema for the migrations. Migrations are templates: unqualified DDL is
     /// created in this schema (via search_path). Apply to several schemas by running
-    /// once per schema. Defaults to `public`.
-    #[arg(long, global = true, default_value = "public")]
-    schema: String,
+    /// once per schema. When omitted, defaults to the connection's current_schema()
+    /// (the first entry in its search_path).
+    #[arg(long, global = true)]
+    schema: Option<String>,
     /// TLS mode: disable, prefer, require.
     #[arg(long, global = true, default_value = "prefer", value_parser = parse_sslmode)]
     sslmode: SslMode,
@@ -280,12 +281,22 @@ fn require_root(root: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 /// global flag is never silently ignored. `hack fix-checksum` touches the
 /// schema-independent canonical row; `hack migrate-from sqlx` records against the
 /// connection's own `current_schema()`. Neither honours an override.
+/// Require an explicit `--schema` for subcommands that always act on a single named schema
+/// (`hack add`, `hack delete`). Unlike `migrate`, these do not fall back to `current_schema()`:
+/// the hack interface always names the schema it manipulates.
+fn require_schema<'a>(db: &'a DbArgs, subcommand: &str) -> anyhow::Result<&'a str> {
+    db.schema.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "--schema is required for '{subcommand}' (it targets a single named schema)"
+        )
+    })
+}
+
 fn reject_schema_override(db: &DbArgs, subcommand: &str) -> anyhow::Result<()> {
-    if db.schema != kryzhen::DEFAULT_SCHEMA {
+    if db.schema.is_some() {
         anyhow::bail!(
             "--schema is not supported for '{subcommand}' (it does not target a single schema); \
-             remove --schema (the default {:?} is implied)",
-            kryzhen::DEFAULT_SCHEMA,
+             remove --schema (it records against the connection's current_schema())"
         );
     }
     Ok(())
@@ -318,8 +329,13 @@ async fn main() -> anyhow::Result<()> {
             let root = require_root(args.root)?;
             let client = connect(&args.db).await?;
             let migrations = file::load_dir(&root)?;
-            let report =
-                migrate(&mut { client }, &migrations, &args.db.schema, args.dry_run).await?;
+            let report = migrate(
+                &mut { client },
+                &migrations,
+                args.db.schema.as_deref(),
+                args.dry_run,
+            )
+            .await?;
             if args.dry_run {
                 if report.applied.is_empty() {
                     println!("Nothing to apply.");
@@ -348,26 +364,25 @@ async fn main() -> anyhow::Result<()> {
             // ------------------------------------------------------------------ hack add
             HackCmd::Add { name, db, verbose } => {
                 init_logging(verbose);
+                let schema = require_schema(&db, "hack add")?;
                 let root = require_root(args.root)?;
                 let mut client = connect(&db).await?;
                 let migrations = file::load_dir(&root)?;
-                hack_add(&mut client, &migrations, &name, &db.schema)
+                hack_add(&mut client, &migrations, &name, schema)
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                println!("Recorded {name:?} as applied to schema {:?}.", db.schema);
+                println!("Recorded {name:?} as applied to schema {schema:?}.");
             }
 
             // ------------------------------------------------------------------ hack delete
             HackCmd::Delete { name, db, verbose } => {
                 init_logging(verbose);
+                let schema = require_schema(&db, "hack delete")?;
                 let mut client = connect(&db).await?;
-                hack_delete(&mut client, &name, &db.schema)
+                hack_delete(&mut client, &name, schema)
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                println!(
-                    "Removed {name:?} from schema {:?} in applied_migrations.",
-                    db.schema
-                );
+                println!("Removed {name:?} from schema {schema:?} in applied_migrations.");
             }
 
             // ------------------------------------------------------------------ hack fix-checksum

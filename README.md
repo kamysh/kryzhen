@@ -63,9 +63,15 @@ kryzhen creates a `mallard` schema (if absent) with an `applied_migrations` tabl
 | `script_text` | Full SQL body as applied. |
 | `applied_on` | Timestamp of application. |
 
-This is the same schema used by mallard, so the two tools can share a database.
+This is mallard's own schema, byte-for-byte — kryzhen creates it by applying mallard's own two self-migrations (see below), so the two tools can share a database.
 
-kryzhen also keeps a companion table `mallard.applied_migration_schemas` recording, per migration, which schema(s) it has been applied to (one row per `(migration_name, schema)`), and a `mallard.migrator_version` table marking the ledger format. See [Multiple schemas](#multiple-schemas-templated-migrations).
+kryzhen also keeps a companion table `mallard.applied_migration_schemas` recording, per migration, which schema(s) it has been applied to (one row per `(migration_name, schema)`). See [Multiple schemas](#multiple-schemas-templated-migrations).
+
+### Self-migration
+
+`mallard.migrator_version` is mallard's *own* self-migration ledger, not a table kryzhen invents. Stock mallard bootstraps itself through two embedded scripts recorded there as versions 0 and 1 (`sql/mallard/0000-setup.sql` creates the `mallard` schema and `migrator_version` itself; `0001-applied-migrations.sql` creates `applied_migrations`). kryzhen embeds and applies those same two scripts verbatim, then layers its own version 2 on top (`0002-multi-schema-tracking.sql`, retrofitting the `UNIQUE(name)` index and creating `applied_migration_schemas`) — recorded in the same ledger table, alongside mallard's own rows.
+
+Run against a database a real mallard already manages, versions 0 and 1 are already in its ledger; only kryzhen's own version 2 applies, leaving mallard's rows untouched. Run against an earlier kryzhen's database that predates this scheme (which stamped a meaningless one-row table under the same name), that table is replaced with mallard's real shape and all three versions are backfilled as already reached — nothing is re-applied.
 
 ---
 
@@ -91,7 +97,7 @@ Tracking is **per schema**: the `mallard.applied_migration_schemas` table record
 
 ### Upgrading an existing database
 
-A database first migrated by an older kryzhen (no per-schema table) is upgraded automatically: on the next run, kryzhen creates the new tables and backfills an association for every already-applied migration against the schema the connection currently resolves to (`current_schema()` — where those objects actually live), then stamps `migrator_version`. Nothing is re-applied. This runs once and is idempotent.
+A database first migrated by an older kryzhen, by an even older pre-multi-schema kryzhen, or by stock mallard itself (none of which tracked per-schema associations) is upgraded automatically: on the next run, kryzhen backfills an association for every already-applied migration against the schema the connection currently resolves to (`current_schema()` — where those objects actually live), then stamps `migrator_version`. Nothing is re-applied. This runs once and is idempotent.
 
 ---
 
@@ -124,8 +130,10 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move { let _ = conn.await; });
 
     let migrations = file::load_dir("migrations")?;
-    // Apply to the `public` schema; pass a different schema per tenant to template.
-    let report: Report = migrate(&mut client, &migrations, "public", false).await?;
+    // `None` targets the connection's current_schema() (the first entry in its
+    // search_path — `public` unless configured otherwise). Pass `Some("schema")` to
+    // target a specific schema, e.g. a different one per tenant to template.
+    let report: Report = migrate(&mut client, &migrations, None, false).await?;
 
     println!("Applied:         {:?}", report.applied);
     println!("Already applied: {:?}", report.already_applied);

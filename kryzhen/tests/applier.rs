@@ -34,9 +34,9 @@ fn mig(name: &str, body: &str) -> Migration {
 
 #[tokio::test]
 async fn ensure_schema_is_idempotent() {
-    let (client, _node) = connect().await;
-    ensure_schema(&client).await.unwrap();
-    ensure_schema(&client).await.unwrap();
+    let (mut client, _node) = connect().await;
+    ensure_schema(&mut client).await.unwrap();
+    ensure_schema(&mut client).await.unwrap();
     let applied = load_applied(&client).await.unwrap();
     assert!(applied.is_empty());
 }
@@ -44,7 +44,7 @@ async fn ensure_schema_is_idempotent() {
 #[tokio::test]
 async fn apply_one_runs_sql_and_records_with_checksum() {
     let (mut client, _node) = connect().await;
-    ensure_schema(&client).await.unwrap();
+    ensure_schema(&mut client).await.unwrap();
 
     let m = mig("create_t", "CREATE TABLE t (id int);");
     apply_one(&mut client, &m, "public").await.unwrap();
@@ -63,7 +63,7 @@ async fn apply_one_runs_sql_and_records_with_checksum() {
 #[tokio::test]
 async fn apply_two_migrations_both_recorded() {
     let (mut client, _node) = connect().await;
-    ensure_schema(&client).await.unwrap();
+    ensure_schema(&mut client).await.unwrap();
     apply_one(
         &mut client,
         &mig("m1", "CREATE TABLE a (id int);"),
@@ -102,12 +102,12 @@ async fn migrate_end_to_end_applies_in_dependency_order_and_is_idempotent() {
     .unwrap();
 
     let migrations = kryzhen::file::load_dir(&dir).unwrap();
-    let report = migrate(&mut client, &migrations, "public", false)
+    let report = migrate(&mut client, &migrations, Some("public"), false)
         .await
         .unwrap();
     assert_eq!(report.applied, vec!["a".to_string(), "b".to_string()]);
 
-    let report2 = migrate(&mut client, &migrations, "public", false)
+    let report2 = migrate(&mut client, &migrations, Some("public"), false)
         .await
         .unwrap();
     assert!(report2.applied.is_empty());
@@ -141,7 +141,7 @@ async fn applies_mallard_example_contacts_tree() {
     let dir = stage_mallard_migrations("apply");
     let migrations = kryzhen::file::load_dir(&dir).unwrap();
 
-    let report = migrate(&mut client, &migrations, "public", false)
+    let report = migrate(&mut client, &migrations, Some("public"), false)
         .await
         .unwrap();
     assert_eq!(
@@ -154,7 +154,7 @@ async fn applies_mallard_example_contacts_tree() {
         ]
     );
 
-    let report2 = migrate(&mut client, &migrations, "public", false)
+    let report2 = migrate(&mut client, &migrations, Some("public"), false)
         .await
         .unwrap();
     assert!(report2.applied.is_empty());
@@ -210,7 +210,7 @@ async fn same_migrations_apply_to_multiple_schemas_independently() {
     let migs_v1 = kryzhen::file::load_dir(&dir).unwrap();
 
     // Apply v1 to tenant_a only.
-    let r = migrate(&mut client, &migs_v1, "tenant_a", false)
+    let r = migrate(&mut client, &migs_v1, Some("tenant_a"), false)
         .await
         .unwrap();
     assert_eq!(r.applied, vec!["a".to_string()]);
@@ -236,14 +236,14 @@ async fn same_migrations_apply_to_multiple_schemas_independently() {
     assert_eq!(in_b, 0, "tenant_b.widgets should NOT exist yet");
 
     // Re-running against tenant_a is a no-op (per-schema skip-set).
-    let r = migrate(&mut client, &migs_v1, "tenant_a", false)
+    let r = migrate(&mut client, &migs_v1, Some("tenant_a"), false)
         .await
         .unwrap();
     assert!(r.applied.is_empty());
     assert_eq!(r.already_applied, vec!["a".to_string()]);
 
     // Now bring tenant_b up to the SAME v1 — it was lagging and catches up.
-    let r = migrate(&mut client, &migs_v1, "tenant_b", false)
+    let r = migrate(&mut client, &migs_v1, Some("tenant_b"), false)
         .await
         .unwrap();
     assert_eq!(r.applied, vec!["a".to_string()]);
@@ -277,6 +277,169 @@ async fn same_migrations_apply_to_multiple_schemas_independently() {
         .unwrap()
         .get(0);
     assert_eq!(assoc, 2, "one association row per (migration, schema)");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `migrate(.., None, ..)` targets the connection's current_schema() (its search_path),
+/// not a hardcoded `public`: with search_path set to a non-public schema, the migration
+/// templates into THAT schema and its association is recorded there.
+#[tokio::test]
+async fn migrate_none_targets_current_schema_not_public() {
+    let (mut client, _node) = connect().await;
+
+    // A non-public schema, made the connection's current_schema() via search_path.
+    client.batch_execute("CREATE SCHEMA app").await.unwrap();
+    client
+        .batch_execute("SET search_path TO app")
+        .await
+        .unwrap();
+
+    let dir = std::env::temp_dir().join(format!("kryzhen-none-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("a.sql"),
+        "-- #!migration\n-- name: \"a\",\n-- description: \"a\";\nCREATE TABLE widgets (id int);\n",
+    )
+    .unwrap();
+    let migrations = kryzhen::file::load_dir(&dir).unwrap();
+
+    // No explicit schema: should resolve to current_schema() == 'app'.
+    let r = migrate(&mut client, &migrations, None, false)
+        .await
+        .unwrap();
+    assert_eq!(r.applied, vec!["a".to_string()]);
+
+    // The table landed in `app`, NOT in `public`.
+    let in_app: i64 = client
+        .query_one(
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema='app' AND table_name='widgets'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let in_public: i64 = client
+        .query_one(
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name='widgets'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        in_app, 1,
+        "widgets should be created in current_schema() 'app'"
+    );
+    assert_eq!(in_public, 0, "widgets must NOT be created in 'public'");
+
+    // The association is recorded against 'app', so a re-run is a no-op.
+    let assoc: i64 = client
+        .query_one(
+            "SELECT count(*) FROM mallard.applied_migration_schemas WHERE migration_name='a' AND schema='app'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(assoc, 1, "association recorded against 'app'");
+
+    let r2 = migrate(&mut client, &migrations, None, false)
+        .await
+        .unwrap();
+    assert!(
+        r2.applied.is_empty(),
+        "re-run against current_schema() is a no-op"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `ensure_schema` must not narrow a multi-entry `search_path` down to a single schema.
+/// `current_schema()` only reports the FIRST resolvable entry (e.g. `ag_catalog` for a
+/// connection configured `ag_catalog, "$user", public`, as mimir's is); restoring via
+/// that single value alone would silently drop the rest for the remainder of a
+/// long-lived connection's session — a real defect for embedded library use even though
+/// a one-shot CLI process would never observe it (the process exits right after).
+#[tokio::test]
+async fn ensure_schema_preserves_full_multi_entry_search_path() {
+    let (mut client, _node) = connect().await;
+
+    client
+        .batch_execute("CREATE SCHEMA one; CREATE SCHEMA two;")
+        .await
+        .unwrap();
+    client
+        .batch_execute("SET search_path TO one, two, public")
+        .await
+        .unwrap();
+
+    ensure_schema(&mut client).await.unwrap();
+
+    let search_path: String = client
+        .query_one("SHOW search_path", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        search_path, "one, two, public",
+        "ensure_schema must restore the full search_path, not just its first entry"
+    );
+
+    std::fs::remove_dir_all(std::env::temp_dir().join("nonexistent")).ok();
+}
+
+/// `migrate(.., Some(name), ..)` still targets the explicitly named schema regardless of
+/// the connection's search_path (regression guard on the Some arm).
+#[tokio::test]
+async fn migrate_some_targets_named_schema_ignoring_search_path() {
+    let (mut client, _node) = connect().await;
+
+    // Two schemas; point search_path at one, but target the OTHER explicitly.
+    client
+        .batch_execute("CREATE SCHEMA one; CREATE SCHEMA two;")
+        .await
+        .unwrap();
+    client
+        .batch_execute("SET search_path TO one")
+        .await
+        .unwrap();
+
+    let dir = std::env::temp_dir().join(format!("kryzhen-some-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("a.sql"),
+        "-- #!migration\n-- name: \"a\",\n-- description: \"a\";\nCREATE TABLE widgets (id int);\n",
+    )
+    .unwrap();
+    let migrations = kryzhen::file::load_dir(&dir).unwrap();
+
+    let r = migrate(&mut client, &migrations, Some("two"), false)
+        .await
+        .unwrap();
+    assert_eq!(r.applied, vec!["a".to_string()]);
+
+    let in_two: i64 = client
+        .query_one(
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema='two' AND table_name='widgets'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let in_one: i64 = client
+        .query_one(
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema='one' AND table_name='widgets'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(in_two, 1, "explicit Some(\"two\") targets 'two'");
+    assert_eq!(
+        in_one, 0,
+        "search_path 'one' is ignored when a schema is named"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -323,7 +486,7 @@ async fn soft_upgrade_backfills_existing_database_without_rerun() {
     .unwrap();
     let migrations = kryzhen::file::load_dir(&dir).unwrap();
 
-    let report = migrate(&mut client, &migrations, "public", false)
+    let report = migrate(&mut client, &migrations, Some("public"), false)
         .await
         .expect("soft upgrade must let an up-to-date legacy DB run without re-applying");
     assert!(report.applied.is_empty(), "nothing should be re-applied");
@@ -342,13 +505,17 @@ async fn soft_upgrade_backfills_existing_database_without_rerun() {
     assert_eq!(assoc, 1, "backfill should record (legacy, public)");
     let version: i64 = client
         .query_one(
-            "SELECT coalesce(max(version),0) FROM mallard.migrator_version",
+            "SELECT coalesce(max(version),-1) FROM mallard.migrator_version",
             &[],
         )
         .await
         .unwrap()
         .get(0);
-    assert_eq!(version, 1, "migrator_version should be stamped to 1");
+    // A pre-ledger kryzhen DB already satisfies self-migrations 0 and 1 (its
+    // applied_migrations always matched mallard's own shape); ensure_schema backfills
+    // those two and then actually runs self-migration 2 (the UNIQUE index +
+    // applied_migration_schemas), landing the ledger at 2.
+    assert_eq!(version, 2, "migrator_version should reach 2");
 
     // Applying a NEW migration to the soft-upgraded old table must work. This is the case
     // the original test missed: the old applied_migrations had no UNIQUE(name), so apply_one's
@@ -364,19 +531,199 @@ async fn soft_upgrade_backfills_existing_database_without_rerun() {
     )
     .unwrap();
     let migrations = kryzhen::file::load_dir(&dir).unwrap();
-    let report = migrate(&mut client, &migrations, "public", false)
+    let report = migrate(&mut client, &migrations, Some("public"), false)
         .await
         .expect("a new migration must apply onto a soft-upgraded (no-UNIQUE) old table");
     assert_eq!(report.applied, vec!["after-upgrade".to_string()]);
 
-    // The version stamp is idempotent: re-running ensure_schema (via migrate) leaves exactly
-    // one migrator_version row.
+    // Re-running ensure_schema (via migrate) is idempotent: no self-migration re-applies,
+    // so the ledger still holds exactly one row per version reached (0, 1, 2).
     let version_rows: i64 = client
         .query_one("SELECT count(*) FROM mallard.migrator_version", &[])
         .await
         .unwrap()
         .get(0);
-    assert_eq!(version_rows, 1, "migrator_version must stay a single row");
+    assert_eq!(
+        version_rows, 3,
+        "migrator_version should hold one row per self-migration"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// An earlier kryzhen's meaningless `(singleton boolean, version bigint)`
+/// `mallard.migrator_version` is replaced with mallard's real shape, backfilling all
+/// three self-migrations as already reached (the legacy table only ever existed once
+/// the UNIQUE index and applied_migration_schemas it stamped were already in place) —
+/// nothing is re-applied.
+#[tokio::test]
+async fn legacy_singleton_migrator_version_is_replaced() {
+    let (mut client, _node) = connect().await;
+
+    // Simulate a database created by the multi-schema-era kryzhen that predates this
+    // self-migration scheme: real applied_migrations shape plus its own
+    // applied_migration_schemas and the meaningless singleton ledger.
+    client
+        .batch_execute(
+            "CREATE SCHEMA mallard; \
+             CREATE TABLE mallard.applied_migrations( \
+                 id bigserial NOT NULL, name text NOT NULL, description text NOT NULL, \
+                 requires text[] NOT NULL, checksum bytea NOT NULL, script_text text NOT NULL, \
+                 applied_on timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (id)); \
+             CREATE UNIQUE INDEX applied_migrations_name_key ON mallard.applied_migrations (name); \
+             CREATE TABLE mallard.applied_migration_schemas( \
+                 id uuid NOT NULL DEFAULT gen_random_uuid(), migration_name text NOT NULL, \
+                 schema text NOT NULL, applied_on timestamptz NOT NULL DEFAULT now(), \
+                 PRIMARY KEY (id), UNIQUE (migration_name, schema)); \
+             CREATE TABLE mallard.migrator_version( \
+                 singleton boolean NOT NULL DEFAULT true, version bigint NOT NULL, \
+                 PRIMARY KEY (singleton), CHECK (singleton)); \
+             INSERT INTO mallard.migrator_version (version) VALUES (1);",
+        )
+        .await
+        .unwrap();
+    let body = "CREATE TABLE legacy_t (id int);";
+    client
+        .execute(
+            "INSERT INTO mallard.applied_migrations (name, description, requires, checksum, script_text) \
+             VALUES ('legacy', 'legacy', ARRAY[]::text[], $1, $2)",
+            &[&kryzhen::types::checksum(body).as_slice(), &body],
+        )
+        .await
+        .unwrap();
+    client
+        .execute(
+            "INSERT INTO mallard.applied_migration_schemas (migration_name, schema) VALUES ('legacy', 'public')",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let dir = std::env::temp_dir().join(format!("kryzhen-legacy-ledger-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("legacy.sql"),
+        format!("-- #!migration\n-- name: \"legacy\",\n-- description: \"legacy\";\n{body}\n"),
+    )
+    .unwrap();
+    let migrations = kryzhen::file::load_dir(&dir).unwrap();
+
+    let report = migrate(&mut client, &migrations, Some("public"), false)
+        .await
+        .expect("legacy ledger replacement must not re-apply anything");
+    assert!(report.applied.is_empty());
+    assert_eq!(report.already_applied, vec!["legacy".to_string()]);
+
+    let has_singleton_column: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+             WHERE table_schema='mallard' AND table_name='migrator_version' AND column_name='singleton')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!has_singleton_column, "legacy shape must be replaced");
+
+    let versions: Vec<i64> = client
+        .query(
+            "SELECT version FROM mallard.migrator_version ORDER BY version",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(
+        versions,
+        vec![0, 1, 2],
+        "all three self-migrations backfilled"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// kryzhen extends a database a real stock mallard already manages: mallard's own
+/// `migrator_version` (versions 0 and 1, real shape) and `applied_migrations` (no
+/// `schema` column, no `UNIQUE(name)` — mallard never added either) are left untouched;
+/// only kryzhen's own self-migration 2 runs, stamped alongside mallard's rows in the
+/// SAME ledger table.
+#[tokio::test]
+async fn extends_a_real_mallard_database() {
+    let (mut client, _node) = connect().await;
+
+    // Simulate exactly what stock mallard leaves behind: its own two self-migrations
+    // applied, plus one real migration it ran (mallard never tracked which schema).
+    client
+        .batch_execute(
+            "CREATE SCHEMA mallard; \
+             CREATE TABLE mallard.migrator_version( \
+                 version bigint NOT NULL, applied_on timestamptz NOT NULL DEFAULT now(), \
+                 PRIMARY KEY (version)); \
+             INSERT INTO mallard.migrator_version (version) VALUES (0), (1); \
+             CREATE TABLE mallard.applied_migrations( \
+                 id bigserial NOT NULL, name text NOT NULL, description text NOT NULL, \
+                 requires text[] NOT NULL, checksum bytea NOT NULL, script_text text NOT NULL, \
+                 applied_on timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (id));",
+        )
+        .await
+        .unwrap();
+    let existing_body = "CREATE TABLE from_mallard_t (id int);";
+    client
+        .execute(
+            "INSERT INTO mallard.applied_migrations (name, description, requires, checksum, script_text) \
+             VALUES ('from-mallard', 'from mallard', ARRAY[]::text[], $1, $2)",
+            &[
+                &kryzhen::types::checksum(existing_body).as_slice(),
+                &existing_body,
+            ],
+        )
+        .await
+        .unwrap();
+
+    let dir = std::env::temp_dir().join(format!("kryzhen-real-mallard-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("existing.sql"),
+        format!(
+            "-- #!migration\n-- name: \"from-mallard\",\n-- description: \"from mallard\";\n{existing_body}\n"
+        ),
+    )
+    .unwrap();
+    let migrations = kryzhen::file::load_dir(&dir).unwrap();
+
+    let report = migrate(&mut client, &migrations, Some("public"), false)
+        .await
+        .expect("kryzhen must extend a real mallard database, not fight it");
+    assert!(report.applied.is_empty());
+    assert_eq!(report.already_applied, vec!["from-mallard".to_string()]);
+
+    // mallard's own rows (0, 1) are untouched; kryzhen's own 2 is appended alongside them.
+    let versions: Vec<i64> = client
+        .query(
+            "SELECT version FROM mallard.migrator_version ORDER BY version",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(versions, vec![0, 1, 2]);
+
+    // Now apply a genuinely new migration on top — proves the shared database is fully
+    // usable via kryzhen going forward, not just readable.
+    std::fs::write(
+        dir.join("new.sql"),
+        "-- #!migration\n-- name: \"brand-new\",\n-- description: \"brand new\";\nCREATE TABLE brand_new_t (id int);\n",
+    )
+    .unwrap();
+    let migrations = kryzhen::file::load_dir(&dir).unwrap();
+    let report = migrate(&mut client, &migrations, Some("public"), false)
+        .await
+        .unwrap();
+    assert_eq!(report.applied, vec!["brand-new".to_string()]);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -435,7 +782,7 @@ async fn migrate_over_tls_require() {
     });
 
     let migrations = kryzhen::file::load_dir(&dir).unwrap();
-    let report = migrate(&mut client, &migrations, "public", false)
+    let report = migrate(&mut client, &migrations, Some("public"), false)
         .await
         .expect("migrate over sslmode=require should succeed");
     assert_eq!(report.applied, vec!["a".to_string()]);
