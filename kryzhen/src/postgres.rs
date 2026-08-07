@@ -7,9 +7,12 @@
 //! ## Multi-schema model
 //!
 //! The same migration set can be applied to many schemas (schema-per-customer / RAG).
-//! Migrations are **templates**: unqualified DDL lands wherever `search_path` points, so
-//! [`apply_one`] runs each body under `SET LOCAL search_path TO <schema>`. Explicitly
-//! schema-qualified DDL still goes where it names.
+//! [`apply_one`] creates the target schema on demand (`CREATE SCHEMA IF NOT EXISTS`, in
+//! the same transaction as the migration it's about to run) — unlike mallard, no
+//! dedicated `CREATE SCHEMA` migration is required first. Migrations are **templates**:
+//! unqualified DDL lands wherever `search_path` points, so [`apply_one`] runs each body
+//! under `SET LOCAL search_path TO <schema>`. Explicitly schema-qualified DDL still goes
+//! where it names.
 //!
 //! > Because the body runs with `search_path` set to the target schema *only*, a migration
 //! > that references an object in another schema (e.g. an extension function) by an
@@ -321,12 +324,19 @@ async fn insert_schema_assoc(client: &impl GenericClient, name: &str, schema: &s
 
 /// Apply one migration to `schema` and record it, atomically.
 ///
-/// In a single transaction: set `search_path` to `schema` (so unqualified DDL templates
-/// into it), run the body, upsert the canonical `applied_migrations` row on first sighting,
-/// and record the `(name, schema)` association. Body and bookkeeping commit together, so a
-/// failure leaves no partial state.
+/// In a single transaction: ensure `schema` itself exists (unlike mallard, kryzhen does
+/// not require a dedicated `CREATE SCHEMA` migration first — the target schema is
+/// created on demand), set `search_path` to it (so unqualified DDL templates into it),
+/// run the body, upsert the canonical `applied_migrations` row on first sighting, and
+/// record the `(name, schema)` association. Everything commits together, so a failure
+/// leaves no partial state — including no orphaned empty schema.
 pub async fn apply_one(client: &mut impl GenericClient, m: &Migration, schema: &str) -> Result<()> {
     let tx = client.transaction().await?;
+    tx.batch_execute(&format!(
+        "CREATE SCHEMA IF NOT EXISTS {}",
+        quote_ident(schema)
+    ))
+    .await?;
     // SET LOCAL is scoped to this transaction; the connection's default search_path is
     // restored on commit. Schema name is quoted as an identifier (not a bind parameter —
     // SET does not accept parameters).

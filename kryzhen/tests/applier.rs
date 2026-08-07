@@ -60,6 +60,39 @@ async fn apply_one_runs_sql_and_records_with_checksum() {
     );
 }
 
+/// `apply_one` creates the target schema itself if it doesn't exist yet — unlike
+/// mallard, kryzhen doesn't require a dedicated "create the schema" migration first.
+#[tokio::test]
+async fn apply_one_creates_target_schema_if_missing() {
+    let (mut client, _node) = connect().await;
+    ensure_schema(&mut client).await.unwrap();
+
+    let exists_before: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = 'tenant_new')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!exists_before, "tenant_new must not exist yet");
+
+    let m = mig("create_t", "CREATE TABLE t (id int);");
+    apply_one(&mut client, &m, "tenant_new")
+        .await
+        .expect("apply_one must create the missing target schema, not fail");
+
+    let count: i64 = client
+        .query_one(
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema='tenant_new' AND table_name='t'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 1, "t must have been created inside the new schema");
+}
+
 #[tokio::test]
 async fn apply_two_migrations_both_recorded() {
     let (mut client, _node) = connect().await;

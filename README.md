@@ -77,14 +77,14 @@ Run against a database a real mallard already manages, versions 0 and 1 are alre
 
 ## Multiple schemas (templated migrations)
 
-The same migration set can be applied independently to many schemas — one schema per customer/tenant, or one per RAG corpus. Migrations act as **templates**:
+The same migration set can be applied independently to many schemas — one schema per customer/tenant, or one per RAG corpus. The target schema itself is created on demand (`CREATE SCHEMA IF NOT EXISTS`, in the same transaction as the first migration applied to it) — no dedicated "create the schema" migration is needed first. Migrations act as **templates**:
 
 - **Unqualified** DDL (`CREATE TABLE widgets …`) is created in the **target schema** — kryzhen runs each migration body under `SET LOCAL search_path TO <schema>`.
 - **Schema-qualified** DDL (`CREATE TABLE other.thing …`) goes exactly where it names.
 
 Because the body runs with `search_path` set to the target schema only, a migration that references an object in *another* schema (e.g. an extension function) by an unqualified name will not resolve it — schema-qualify such references.
 
-Apply to a schema with `--schema` (library: the `schema` argument to `migrate`). It defaults to `public`, which reproduces single-schema behaviour. To roll the same migrations out to several schemas, run once per schema:
+Apply to a schema with `--schema` (library: the `schema` argument to `migrate`). Omit it to target the connection's `current_schema()` (`public` unless configured otherwise). To roll the same migrations out to several schemas, run once per schema:
 
 ```bash
 kryzhen --database app --schema customer_a migrations/
