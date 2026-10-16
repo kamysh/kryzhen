@@ -11,7 +11,7 @@ Available as:
 
 ## Installation
 
-Download a prebuilt **2.0.2** CLI (no Rust or Nix installation required):
+Download a prebuilt **2.0.3** CLI (no Rust or Nix installation required):
 
 ```sh
 mkdir -p "$HOME/.local/bin"
@@ -21,7 +21,7 @@ case "$(uname -s)-$(uname -m)" in
   Darwin-arm64)  ASSET=kryzhen-darwin-arm64 ;;
   *) echo "See docs/development.md for a source build" >&2; exit 1 ;;
 esac
-curl -fL "https://github.com/kamysh/kryzhen/releases/download/v2.0.2/${ASSET}" \
+curl -fL "https://github.com/kamysh/kryzhen/releases/download/v2.0.3/${ASSET}" \
   -o "$HOME/.local/bin/kryzhen"
 chmod +x "$HOME/.local/bin/kryzhen"
 export PATH="$HOME/.local/bin:$PATH"
@@ -33,7 +33,7 @@ published on crates.io):
 
 ```toml
 [dependencies]
-kryzhen = { git = "https://github.com/kamysh/kryzhen", tag = "v2.0.2" }
+kryzhen = { git = "https://github.com/kamysh/kryzhen", tag = "v2.0.3" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = "0.7"
 anyhow = "1"
@@ -210,7 +210,7 @@ with `--root` (or `-r`); use `--root .` for the current directory.
 | `--ssl-root-cert <PATH>` | *(none)* | CA certificate for `verify-ca` / `verify-full` (PEM). |
 | `--ssl-client-cert <PATH>` | *(none)* | Client certificate for mutual TLS (PEM). |
 | `--ssl-client-key <PATH>` | *(none)* | Client private key for mutual TLS (PEM). |
-| `--dry-run` | off | Print the planned migration order; apply nothing. |
+| `--dry-run` | off | Print the planned migration order; apply nothing. Supported only by the default migration command; rejected with subcommands before any connection or file access. |
 | `-v, --verbose` | off | Enable debug-level logging. |
 | `-h, --help` | | Print help. |
 | `-V, --version` | | Print version. |
@@ -287,6 +287,12 @@ kryzhen hack add <NAME> --root migrations/ --database mydb --schema public
 
 Records `NAME` as applied (to the required `--schema`) without executing the SQL body. Useful when a migration has already been applied by other means (e.g. provisioned by Terraform, applied by another tool). Fails if any of the migration's `requires` are not yet applied **to that schema**.
 
+If the migration already has a record in `mallard.applied_migrations`, that record
+is preserved and the missing schema association is added. Before repairing an
+association, verify that the migration's SQL effects already exist in the target
+schema and that its stored checksum matches the migration file. `hack add` does
+not perform those checks itself.
+
 ### `hack delete` — remove a migration record without running any SQL
 
 ```bash
@@ -323,19 +329,24 @@ kryzhen hack migrate-from sqlx convert --root migrations/ --database mydb
 kryzhen hack migrate-from sqlx import --root migrations/ --database mydb
 
 # Or run both phases in one command:
-kryzhen hack migrate-from sqlx all [MIGRATIONS_DIR] --database mydb
+kryzhen hack migrate-from sqlx all --root migrations/ --database mydb
 ```
 
-`MIGRATIONS_DIR` defaults to `.`. The `_sqlx_migrations` table is never modified.
+`--root` is required; use `--root .` if the current directory is the migration
+root. `convert` reads `_sqlx_migrations` without modifying it. A successful
+`import` drops that table after recording the imported history in Kryzhen.
 
-After a successful import you can use `kryzhen migrate` as normal. sqlx should no longer manage those migrations.
+After a successful import, apply pending migrations with
+`kryzhen --root migrations/ --database mydb`. sqlx should no longer manage those
+migrations. Import records new migrations against the connection's
+`current_schema()`; ensure it identifies the schema where sqlx applied them.
 
 ### What each phase does
 
 | Phase | Input | Output |
 |---|---|---|
 | `convert` | `_sqlx_migrations` rows + original files | Files rewritten with `#!migration` headers; `.kryzhen-import-receipt.json` written |
-| `import` | Receipt + `_sqlx_migrations` (re-verified) + converted files | Rows inserted into `mallard.applied_migrations` |
+| `import` | Receipt + `_sqlx_migrations` (re-verified) + converted files | Missing migration records and their schema associations inserted into `mallard`; `_sqlx_migrations` dropped after success |
 
 ### Team workflow
 

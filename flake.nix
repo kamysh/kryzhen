@@ -27,7 +27,7 @@
         # external Docker daemon for testcontainers.
         commonAttrs = {
           pname = "kryzhen";
-          version = "2.0.2";
+          version = "2.0.3";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = [ pkgs.pkg-config ];
