@@ -54,7 +54,9 @@ cargo test --workspace
 
 The CLI transport regression suite generates its own certificates and starts
 disposable PostgreSQL containers. It checks certificate trust, hostnames, mutual
-TLS and refusal of plaintext for required-TLS modes:
+TLS and refusal of plaintext for required-TLS modes. It also verifies real
+password-file authentication with quotes, spaces, escaped colons/backslashes,
+first-match ordering, wildcards, and Unix permission enforcement:
 
 ```sh
 cargo build --workspace

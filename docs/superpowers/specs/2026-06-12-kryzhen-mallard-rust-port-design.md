@@ -236,6 +236,15 @@ The `-t/--test` flag from mallard is **removed** (tests dropped).
 
 ### Connection transport
 
+Passwords are passed as values to the driver's configuration API, never
+interpolated into connection strings. When no explicit password is supplied,
+the CLI reads `PGPASSFILE`, or `$HOME/.pgpass` when unset. The first matching
+entry wins; the first four fields support `*` wildcards and backslash escapes.
+Escaped colons and backslashes are decoded in all fields. Quotes and whitespace,
+including leading and trailing password spaces, are preserved literally.
+Comments start with `#` in column one. On Unix, password files with group or
+world permissions are ignored.
+
 The CLI supports `disable`, `prefer`, `require`, `verify-ca`, and `verify-full`.
 `disable` uses plaintext; `prefer` permits plaintext only when PostgreSQL declines
 TLS. A failed TLS handshake or authentication is an error, not a reason to retry

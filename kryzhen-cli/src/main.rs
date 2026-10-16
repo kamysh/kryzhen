@@ -173,23 +173,68 @@ fn parse_sslmode(s: &str) -> Result<SslMode, String> {
 }
 
 fn pgpass_lookup(host: &str, port: u16, dbname: &str, user: &str) -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let path = std::path::Path::new(&home).join(".pgpass");
+    let path = std::env::var_os("PGPASSFILE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".pgpass")))?;
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            eprintln!(
+                "Ignoring password file {}: group or world access is permitted; use chmod 600",
+                path.display()
+            );
+            return None;
+        }
+    }
     let content = std::fs::read_to_string(path).ok()?;
+    pgpass_password(&content, host, port, dbname, user)
+}
+
+// A backslash quotes the next character; only an unescaped colon ends a field.
+fn pgpass_field(input: &str) -> (String, Option<&str>) {
+    let mut value = String::new();
+    let mut chars = input.char_indices();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            ':' => return (value, Some(&input[index + 1..])),
+            '\\' => value.push(chars.next().map_or('\\', |(_, escaped)| escaped)),
+            _ => value.push(ch),
+        }
+    }
+    (value, None)
+}
+
+fn pgpass_password(
+    content: &str,
+    host: &str,
+    port: u16,
+    dbname: &str,
+    user: &str,
+) -> Option<String> {
     let port_s = port.to_string();
-    for line in content.lines() {
-        let line = line.trim();
+    'lines: for line in content.split('\n') {
+        let line = line.trim_end_matches('\r');
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let parts: Vec<&str> = line.splitn(5, ':').collect();
-        if parts.len() != 5 {
-            continue;
+        let mut rest = line;
+        for expected in [host, &port_s, dbname, user] {
+            let wildcard = rest.starts_with("*:");
+            let (value, next) = pgpass_field(rest);
+            let Some(next) = next else {
+                continue 'lines;
+            };
+            if !wildcard && value != expected {
+                continue 'lines;
+            }
+            rest = next;
         }
-        let m = |pat: &str, val: &str| pat == "*" || pat == val;
-        if m(parts[0], host) && m(parts[1], &port_s) && m(parts[2], dbname) && m(parts[3], user) {
-            return Some(parts[4].to_owned());
-        }
+        return Some(pgpass_field(rest).0);
     }
     None
 }

@@ -30,11 +30,85 @@ fn documented_tls_modes_enforce_transport_policy() {
 
 #[test]
 fn password_is_not_interpreted_as_connection_string() {
-    let parsed = args(&["--password", "a ' password\\ with spaces"]);
+    let password = "  a ' \" password:with\\ spaces  ";
+    let parsed = args(&["--password", password]);
     let config = connection_config(&parsed.db).unwrap();
+    assert_eq!(config.get_password(), Some(password.as_bytes()));
+}
+
+#[test]
+fn pgpass_preserves_quotes_spaces_and_decodes_escapes() {
+    let content = "localhost:5432:test:postgres:  a ' \" password\\:with\\\\ spaces  \r\n";
     assert_eq!(
-        config.get_password(),
-        Some(b"a ' password\\ with spaces".as_slice())
+        pgpass_password(content, "localhost", 5432, "test", "postgres").as_deref(),
+        Some("  a ' \" password:with\\ spaces  ")
+    );
+}
+
+#[test]
+fn pgpass_matches_escaped_fields_and_literal_star() {
+    let content = r"\:\:1:5432:db\:name:user\\name:correct";
+    assert_eq!(
+        pgpass_password(content, "::1", 5432, "db:name", "user\\name").as_deref(),
+        Some("correct")
+    );
+    let content = "localhost:5432:\\*:postgres:literal\n*:*:*:*:fallback";
+    assert_eq!(
+        pgpass_password(content, "localhost", 5432, "*", "postgres").as_deref(),
+        Some("literal")
+    );
+    assert_eq!(
+        pgpass_password(content, "localhost", 5432, "other", "postgres").as_deref(),
+        Some("fallback")
+    );
+}
+
+#[test]
+fn pgpass_uses_first_match_and_skips_comments_and_incomplete_entries() {
+    let content = "#*:*:*:*:comment\n\nlocalhost:5432:test\nother:5432:test:postgres:wrong\nlocalhost:*:test:postgres:first\n*:*:*:*:second\n";
+    assert_eq!(
+        pgpass_password(content, "localhost", 5432, "test", "postgres").as_deref(),
+        Some("first")
+    );
+    assert_eq!(
+        pgpass_password(
+            "localhost:5432:test:postgres",
+            "localhost",
+            5432,
+            "test",
+            "postgres"
+        ),
+        None
+    );
+}
+
+#[test]
+fn pgpass_handles_empty_password_line_endings_and_unicode() {
+    for ending in ["", "\n", "\r\n", "\r"] {
+        let content = format!("localhost:5432:test:postgres:{ending}");
+        assert_eq!(
+            pgpass_password(&content, "localhost", 5432, "test", "postgres"),
+            Some(String::new())
+        );
+    }
+    assert_eq!(
+        pgpass_password("*:*:*:*: парóль ", "localhost", 5432, "test", "postgres").as_deref(),
+        Some(" парóль ")
+    );
+    assert_eq!(
+        pgpass_password("*:*:*:*:end\\", "localhost", 5432, "test", "postgres").as_deref(),
+        Some("end\\")
+    );
+    assert_eq!(
+        pgpass_password(
+            "*:*:*:*:first:ignored",
+            "localhost",
+            5432,
+            "test",
+            "postgres"
+        )
+        .as_deref(),
+        Some("first")
     );
 }
 

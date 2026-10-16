@@ -9,8 +9,8 @@ import time
 import uuid
 
 
-def run(*args, ok=True):
-    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+def run(*args, ok=True, env=None):
+    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120, env=env)
     print("+", " ".join(map(str, args)), flush=True)
     print(result.stdout, end="", flush=True)
     if ok and result.returncode:
@@ -21,6 +21,7 @@ def run(*args, ok=True):
 default_binary = Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "debug/kryzhen"
 binary = str(Path(sys.argv[1] if len(sys.argv) > 1 else default_binary).resolve())
 containers = []
+password = "  p:'\"\\ with spaces  "  # Public test fixture, never a real credential.
 try:
     with tempfile.TemporaryDirectory(prefix="kryzhen-cli-tls-") as directory:
         root = Path(directory)
@@ -43,7 +44,7 @@ try:
             name = "kryzhen-test-" + uuid.uuid4().hex[:12]
             containers.append(name)
             args = ["docker", "run", "--detach", "--rm", "--name", name,
-                    "-e", "POSTGRES_PASSWORD=postgres", "-p", "127.0.0.1::5432"]
+                    "-e", f"POSTGRES_PASSWORD={password}", "-p", "127.0.0.1::5432"]
             if tls:
                 args += ["--mount", f"type=bind,src={root},dst=/certs,readonly", "postgres:17", "sh", "-c",
                          "install -o postgres -g postgres -m 600 /certs/server.key /var/lib/postgresql/server.key && "
@@ -68,10 +69,12 @@ try:
         identity = ["--ssl-client-cert", str(root / "client.crt"), "--ssl-client-key", str(root / "client.key")]
         ca = ["--ssl-root-cert", str(root / "ca.crt")]
 
-        def check(label, port, mode, extra=(), host="localhost", success=True):
-            result = run(binary, "--database", "postgres", "--user", "postgres", "--password", "postgres",
+        def check(label, port, mode, extra=(), host="localhost", success=True, password_file=None):
+            credentials = ["--password", password] if password_file is None else []
+            env = dict(os.environ, PGPASSFILE=str(password_file)) if password_file is not None else None
+            result = run(binary, "--database", "postgres", "--user", "postgres", *credentials,
                          "--host", host, "--port", port, "--root", str(migrations), "--dry-run",
-                         "--sslmode", mode, *extra, ok=False)
+                         "--sslmode", mode, *extra, ok=False, env=env)
             if (result.returncode == 0) != success:
                 raise AssertionError(f"{label}: unexpected exit {result.returncode}")
             print("PASS:", label, flush=True)
@@ -87,7 +90,28 @@ try:
             check(f"{mode} rejects plaintext-only server", plain_port, mode, success=False)
         check("prefer permits plaintext-only server", plain_port, "prefer")
         check("disable connects to plaintext-only server", plain_port, "disable")
-        print("All CLI TLS checks passed.", flush=True)
+        pgpass = root / "passwords"
+        pgpass.touch(mode=0o600)
+        escaped = password.replace("\\", "\\\\").replace(":", "\\:")
+        entry = f"localhost:{plain_port}:postgres:postgres:{escaped}"
+        for label, content, success in [
+            ("quotes, spaces, colon and backslash survive pgpass authentication", entry, True),
+            ("CRLF, comments and incomplete entries", f"# comment\r\ninvalid\r\n{entry}\r\n", True),
+            ("first matching entry wins", entry + "\n*:*:*:*:wrong", True),
+            ("first matching wrong password is not skipped", "*:*:*:*:wrong\n" + entry, False),
+            ("wildcard entry authenticates", f"*:*:*:*:{escaped}", True),
+            ("nonmatching entry is skipped", "other:*:*:*:wrong\n" + entry, True),
+            ("password spaces are significant", entry.rstrip(), False),
+        ]:
+            pgpass.write_text(content)
+            check(label, plain_port, "disable", password_file=pgpass, success=success)
+        pgpass.write_text(entry)
+        for mode in [0o640, 0o604]:
+            pgpass.chmod(mode)
+            check(f"insecure password file {mode:o} is ignored", plain_port, "disable", password_file=pgpass, success=False)
+        pgpass.chmod(0o400)
+        check("owner-only read permission is sufficient", plain_port, "disable", password_file=pgpass)
+        print("All CLI TLS and password-file checks passed.", flush=True)
 finally:
     for name in containers:
         run("docker", "rm", "--force", name, ok=False)

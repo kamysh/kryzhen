@@ -225,6 +225,19 @@ Prints the migrations that would be applied, in topological order, without modif
 
 ---
 
+## Password files
+
+When `--password` is omitted, the CLI reads `PGPASSFILE` if set, otherwise
+`~/.pgpass`. Each entry is `host:port:database:user:password`; the first matching
+entry is used, and `*` matches any value in the first four fields. On Unix, use
+`chmod 600` on the file; files accessible by group or others are ignored.
+
+In the file, escape `:` as `\:` and `\` as `\\`. Single quotes, double quotes,
+and spaces are literal, including spaces at the beginning or end of a password.
+Do not surround the password with quotes. These are
+[PostgreSQL password-file rules](https://www.postgresql.org/docs/current/libpq-pgpass.html);
+shell quoting when passing `--password` is separate.
+
 ## TLS
 
 The CLI supports these `--sslmode` values. Library users supply their own
