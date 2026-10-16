@@ -52,6 +52,22 @@ integration) is:
 cargo test --workspace
 ```
 
+The CLI transport regression suite generates its own certificates and starts
+disposable PostgreSQL containers. It checks certificate trust, hostnames, mutual
+TLS and refusal of plaintext for required-TLS modes. It also verifies real
+password-file authentication with quotes, spaces, escaped colons/backslashes,
+first-match ordering, wildcards, and Unix permission enforcement. Environment
+password tests verify `--password` / `PGPASSWORD` / password-file precedence:
+
+```sh
+cargo build --workspace
+python3 scripts/test-cli-tls.py
+```
+
+It requires Docker, Python 3 and the `openssl` command. Set `TMPDIR` to choose
+where temporary certificates are stored. Containers and certificate files are
+removed when the test finishes. Release builds depend on these checks in CI.
+
 The integration tests include a run against mallard's own `example-contacts` migration
 tree (vendored verbatim under `kryzhen/tests/fixtures/mallard-example-contacts/`),
 which exercises real-world dependency resolution, the multiple-blocks-per-file path,

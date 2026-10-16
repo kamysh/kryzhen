@@ -129,10 +129,10 @@ struct DbArgs {
     /// (the first entry in its search_path).
     #[arg(long, global = true)]
     schema: Option<String>,
-    /// TLS mode: disable, prefer, require.
+    /// TLS mode: disable, prefer, require, verify-ca, verify-full.
     #[arg(long, global = true, default_value = "prefer", value_parser = parse_sslmode)]
     sslmode: SslMode,
-    /// Password (for testing; prefer ~/.pgpass in production).
+    /// Password; overrides PGPASSWORD and the password file.
     #[arg(long, global = true)]
     password: Option<String>,
     #[arg(long, global = true)]
@@ -148,6 +148,8 @@ enum SslMode {
     Disable,
     Prefer,
     Require,
+    VerifyCa,
+    VerifyFull,
 }
 
 impl std::str::FromStr for SslMode {
@@ -157,8 +159,10 @@ impl std::str::FromStr for SslMode {
             "disable" => Ok(SslMode::Disable),
             "prefer" => Ok(SslMode::Prefer),
             "require" => Ok(SslMode::Require),
+            "verify-ca" => Ok(SslMode::VerifyCa),
+            "verify-full" => Ok(SslMode::VerifyFull),
             other => Err(format!(
-                "unknown sslmode {other:?}; use disable, prefer, or require"
+                "unknown sslmode {other:?}; use disable, prefer, require, verify-ca, or verify-full"
             )),
         }
     }
@@ -169,100 +173,157 @@ fn parse_sslmode(s: &str) -> Result<SslMode, String> {
 }
 
 fn pgpass_lookup(host: &str, port: u16, dbname: &str, user: &str) -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let path = std::path::Path::new(&home).join(".pgpass");
+    let path = std::env::var_os("PGPASSFILE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".pgpass")))?;
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            eprintln!(
+                "Ignoring password file {}: group or world access is permitted; use chmod 600",
+                path.display()
+            );
+            return None;
+        }
+    }
     let content = std::fs::read_to_string(path).ok()?;
+    pgpass_password(&content, host, port, dbname, user)
+}
+
+// A backslash quotes the next character; only an unescaped colon ends a field.
+fn pgpass_field(input: &str) -> (String, Option<&str>) {
+    let mut value = String::new();
+    let mut chars = input.char_indices();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            ':' => return (value, Some(&input[index + 1..])),
+            '\\' => value.push(chars.next().map_or('\\', |(_, escaped)| escaped)),
+            _ => value.push(ch),
+        }
+    }
+    (value, None)
+}
+
+fn pgpass_password(
+    content: &str,
+    host: &str,
+    port: u16,
+    dbname: &str,
+    user: &str,
+) -> Option<String> {
     let port_s = port.to_string();
-    for line in content.lines() {
-        let line = line.trim();
+    'lines: for line in content.split('\n') {
+        let line = line.trim_end_matches('\r');
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let parts: Vec<&str> = line.splitn(5, ':').collect();
-        if parts.len() != 5 {
-            continue;
+        let mut rest = line;
+        for expected in [host, &port_s, dbname, user] {
+            let wildcard = rest.starts_with("*:");
+            let (value, next) = pgpass_field(rest);
+            let Some(next) = next else {
+                continue 'lines;
+            };
+            if !wildcard && value != expected {
+                continue 'lines;
+            }
+            rest = next;
         }
-        let m = |pat: &str, val: &str| pat == "*" || pat == val;
-        if m(parts[0], host) && m(parts[1], &port_s) && m(parts[2], dbname) && m(parts[3], user) {
-            return Some(parts[4].to_owned());
-        }
+        return Some(pgpass_field(rest).0);
     }
     None
 }
 
-async fn connect(db: &DbArgs) -> anyhow::Result<Client> {
+fn connection_config(db: &DbArgs) -> anyhow::Result<tokio_postgres::Config> {
+    use tokio_postgres::config::SslMode as DriverSslMode;
     let database = db
         .database
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("--database is required"))?;
-
-    let password = db
+    if db.ssl_client_cert.is_some() != db.ssl_client_key.is_some() {
+        anyhow::bail!("--ssl-client-cert and --ssl-client-key must be supplied together");
+    }
+    if db.sslmode == SslMode::Disable
+        && (db.ssl_root_cert.is_some() || db.ssl_client_cert.is_some())
+    {
+        anyhow::bail!("TLS certificate options cannot be used with --sslmode disable");
+    }
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host(&db.host)
+        .port(db.port)
+        .user(&db.user)
+        .dbname(database);
+    if let Some(password) = db
         .password
         .clone()
-        .or_else(|| pgpass_lookup(&db.host, db.port, database, &db.user));
-
-    let conn_str = match password {
-        Some(pw) => format!(
-            "host={} port={} user={} dbname={} password={}",
-            db.host, db.port, db.user, database, pw,
-        ),
-        None => format!(
-            "host={} port={} user={} dbname={}",
-            db.host, db.port, db.user, database,
-        ),
-    };
-
-    let client = match db.sslmode {
-        SslMode::Disable => {
-            let conn_str = format!("{conn_str} sslmode=disable");
-            let (client, conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
-            tokio::spawn(async move {
-                let _ = conn.await;
-            });
-            client
-        }
-        SslMode::Prefer => {
-            let conn_str_tls = format!("{conn_str} sslmode=prefer");
-            let builder = TlsConnector::builder()
-                .danger_accept_invalid_certs(true)
-                .build()?;
-            let connector = MakeTlsConnector::new(builder);
-            match tokio_postgres::connect(&conn_str_tls, connector).await {
-                Ok((client, conn)) => {
-                    tokio::spawn(async move {
-                        let _ = conn.await;
-                    });
-                    client
-                }
-                Err(_) => {
-                    let conn_str_notls = format!("{conn_str} sslmode=disable");
-                    let (client, conn) = tokio_postgres::connect(&conn_str_notls, NoTls).await?;
-                    tokio::spawn(async move {
-                        let _ = conn.await;
-                    });
-                    client
-                }
-            }
-        }
-        SslMode::Require => {
-            let conn_str = format!("{conn_str} sslmode=require");
-            let builder = TlsConnector::builder()
-                .danger_accept_invalid_certs(true)
-                .build()?;
-            let connector = MakeTlsConnector::new(builder);
-            let (client, conn) = tokio_postgres::connect(&conn_str, connector).await?;
-            tokio::spawn(async move {
-                let _ = conn.await;
-            });
-            client
-        }
-    };
-    Ok(client)
+        .or_else(|| {
+            std::env::var("PGPASSWORD")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| pgpass_lookup(&db.host, db.port, database, &db.user))
+    {
+        config.password(password);
+    }
+    config.ssl_mode(match db.sslmode {
+        SslMode::Disable => DriverSslMode::Disable,
+        SslMode::Prefer => DriverSslMode::Prefer,
+        SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => DriverSslMode::Require,
+    });
+    Ok(config)
 }
 
-// ---------------------------------------------------------------------------
-// Logging
-// ---------------------------------------------------------------------------
+fn tls_connector(db: &DbArgs) -> anyhow::Result<MakeTlsConnector> {
+    let mut builder = TlsConnector::builder();
+    match db.sslmode {
+        SslMode::Prefer | SslMode::Require => {
+            builder
+                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_hostnames(true);
+        }
+        SslMode::VerifyCa => {
+            builder.danger_accept_invalid_hostnames(true);
+        }
+        SslMode::VerifyFull => {}
+        SslMode::Disable => anyhow::bail!("TLS is disabled"),
+    }
+    if let Some(path) = &db.ssl_root_cert {
+        builder.disable_built_in_roots(true);
+        builder.add_root_certificate(native_tls::Certificate::from_pem(&std::fs::read(path)?)?);
+    }
+    if let (Some(cert), Some(key)) = (&db.ssl_client_cert, &db.ssl_client_key) {
+        builder.identity(native_tls::Identity::from_pkcs8(
+            &std::fs::read(cert)?,
+            &std::fs::read(key)?,
+        )?);
+    }
+    Ok(MakeTlsConnector::new(builder.build()?))
+}
+
+async fn connect(db: &DbArgs) -> anyhow::Result<Client> {
+    let config = connection_config(db)?;
+    if db.sslmode == SslMode::Disable {
+        let (client, connection) = config.connect(NoTls).await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(client)
+    } else {
+        // The driver handles a server declining SSL in Prefer mode. A TLS or
+        // authentication error must propagate rather than trigger a plaintext retry.
+        let (client, connection) = config.connect(tls_connector(db)?).await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(client)
+    }
+}
 
 fn init_logging(verbose: bool) {
     let level = if verbose { "debug" } else { "info" };
@@ -513,3 +574,6 @@ async fn main() -> anyhow::Result<()> {
 fn fmt_sqlx_err(e: SqlxImportError) -> anyhow::Error {
     anyhow::anyhow!("{e}")
 }
+
+#[cfg(test)]
+mod tests;

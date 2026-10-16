@@ -174,6 +174,12 @@ root dir ──file──▶ Vec<Migration> (per-file blocks, file order preserv
 ```
 
 **Transactions & safety**
+- Dry runs issue reads only: no schema creation, self-migration, bookkeeping
+  writes, or migration SQL, including on a fresh database and inside a read-only
+  transaction. Missing tracking tables mean no recorded migrations. Existing
+  canonical checksums are still validated. Before per-schema tracking exists,
+  recorded migrations belong to the connection's current schema, matching the
+  normal bootstrap's association rule without performing the backfill.
 - Each migration applies in its own transaction; the bookkeeping `INSERT` is part of
   the same transaction, so migration + record commit atomically.
 - A failing migration rolls back and aborts the whole run with a non-zero exit. Earlier
@@ -214,7 +220,7 @@ Faithful to mallard's flags, plus modern polish:
 
 ```
 kryzhen --database <DB> [--host 127.0.0.1] [--port 5432]
-        [--user postgres] [--password ""] [ROOT_DIR]
+        [--user postgres] [--password ""] --root ROOT_DIR
 
   --database ARG   Database name (required).
   --host ARG       Server host (default: 127.0.0.1).
@@ -223,10 +229,38 @@ kryzhen --database <DB> [--host 127.0.0.1] [--port 5432]
   --password ARG   Password (default: "").
   --dry-run        Print the planned migration order; apply nothing.
   -v, --verbose    Structured logging (tracing).
-  ROOT_DIR         Root directory of the migration tree (positional).
+  -r, --root ARG   Root directory containing migration files (required).
 ```
 
 The `-t/--test` flag from mallard is **removed** (tests dropped).
+
+### Connection transport
+
+Passwords are passed as values to the driver's configuration API, never
+interpolated into connection strings. An explicit `--password` takes precedence
+over a nonempty `PGPASSWORD` environment variable. Environment passwords are
+literal values, without password-file escape decoding. If neither is supplied
+(including an empty `PGPASSWORD`), the CLI reads `PGPASSFILE`, or `$HOME/.pgpass`
+when unset. The first matching
+entry wins; the first four fields support `*` wildcards and backslash escapes.
+Escaped colons and backslashes are decoded in all fields. Quotes and whitespace,
+including leading and trailing password spaces, are preserved literally.
+Comments start with `#` in column one. On Unix, password files with group or
+world permissions are ignored.
+
+The CLI supports `disable`, `prefer`, `require`, `verify-ca`, and `verify-full`.
+`disable` uses plaintext; `prefer` permits plaintext only when PostgreSQL declines
+TLS. A failed TLS handshake or authentication is an error, not a reason to retry
+in plaintext. `require` encrypts without authenticating the server certificate.
+`verify-ca` requires TLS and a trusted certificate chain; `verify-full` also
+checks the hostname. Both verification modes use system trust unless a CA PEM
+file is supplied. An explicit CA file selects that trust store.
+Client certificate and PKCS#8 PEM key options must be supplied together and are
+used for mutual TLS. TLS certificate options with `disable` are rejected.
+The library accepts a caller-owned connection; these are CLI connection options.
+
+`file::load_dir` accepts string paths as well as `Path`/`PathBuf` values through
+`AsRef<Path>` so the documented library example compiles unchanged.
 
 ---
 

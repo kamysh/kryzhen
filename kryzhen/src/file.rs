@@ -22,10 +22,10 @@ pub fn apply_implicit_deps(mut blocks: Vec<Migration>) -> Vec<Migration> {
 
 /// Walk `root` recursively, parse every `*.sql` file, and return all migrations
 /// with implicit in-file deps applied. Files are processed in sorted path order.
-pub fn load_dir(root: &Path) -> Result<Vec<Migration>> {
+pub fn load_dir(root: impl AsRef<Path>) -> Result<Vec<Migration>> {
     use walkdir::WalkDir;
 
-    let mut paths: Vec<_> = WalkDir::new(root)
+    let mut paths: Vec<_> = WalkDir::new(root.as_ref())
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
