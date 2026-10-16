@@ -237,8 +237,11 @@ The `-t/--test` flag from mallard is **removed** (tests dropped).
 ### Connection transport
 
 Passwords are passed as values to the driver's configuration API, never
-interpolated into connection strings. When no explicit password is supplied,
-the CLI reads `PGPASSFILE`, or `$HOME/.pgpass` when unset. The first matching
+interpolated into connection strings. An explicit `--password` takes precedence
+over a nonempty `PGPASSWORD` environment variable. Environment passwords are
+literal values, without password-file escape decoding. If neither is supplied
+(including an empty `PGPASSWORD`), the CLI reads `PGPASSFILE`, or `$HOME/.pgpass`
+when unset. The first matching
 entry wins; the first four fields support `*` wildcards and backslash escapes.
 Escaped colons and backslashes are decoded in all fields. Quotes and whitespace,
 including leading and trailing password spaces, are preserved literally.

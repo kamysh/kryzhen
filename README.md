@@ -205,7 +205,7 @@ with `--root` (or `-r`); use `--root .` for the current directory.
 | `--port <PORT>` | `5432` | Server port. |
 | `--user <USER>` | `postgres` | Username. |
 | `--schema <SCHEMA>` | `current_schema()` | Target schema for the migrations. See [Multiple schemas](#multiple-schemas-templated-migrations). |
-| `--password <PASSWORD>` | *(empty)* | Password. |
+| `--password <PASSWORD>` | `PGPASSWORD`, then password file | Password; overrides environment and file values. |
 | `--sslmode <MODE>` | `prefer` | TLS mode: `disable`, `prefer`, `require`, `verify-ca`, or `verify-full`. See [TLS](#tls). |
 | `--ssl-root-cert <PATH>` | *(none)* | CA certificate for `verify-ca` / `verify-full` (PEM). |
 | `--ssl-client-cert <PATH>` | *(none)* | Client certificate for mutual TLS (PEM). |
@@ -225,9 +225,18 @@ Prints the migrations that would be applied, in topological order, without modif
 
 ---
 
-## Password files
+## Passwords
 
-When `--password` is omitted, the CLI reads `PGPASSFILE` if set, otherwise
+The CLI uses `--password` first, then the `PGPASSWORD` environment variable,
+then the password file. An empty `PGPASSWORD` falls back to the file.
+Environment passwords are used literally: do not apply `.pgpass` escaping to
+them. For example:
+
+```sh
+PGPASSWORD='example password' kryzhen --database mydb --root migrations/
+```
+
+For the password file, the CLI reads `PGPASSFILE` if set, otherwise
 `~/.pgpass`. Each entry is `host:port:database:user:password`; the first matching
 entry is used, and `*` matches any value in the first four fields. On Unix, use
 `chmod 600` on the file; files accessible by group or others are ignored.

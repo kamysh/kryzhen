@@ -132,7 +132,7 @@ struct DbArgs {
     /// TLS mode: disable, prefer, require, verify-ca, verify-full.
     #[arg(long, global = true, default_value = "prefer", value_parser = parse_sslmode)]
     sslmode: SslMode,
-    /// Password (for testing; prefer ~/.pgpass in production).
+    /// Password; overrides PGPASSWORD and the password file.
     #[arg(long, global = true)]
     password: Option<String>,
     #[arg(long, global = true)]
@@ -262,6 +262,11 @@ fn connection_config(db: &DbArgs) -> anyhow::Result<tokio_postgres::Config> {
     if let Some(password) = db
         .password
         .clone()
+        .or_else(|| {
+            std::env::var("PGPASSWORD")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
         .or_else(|| pgpass_lookup(&db.host, db.port, database, &db.user))
     {
         config.password(password);

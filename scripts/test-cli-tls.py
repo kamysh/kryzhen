@@ -69,9 +69,18 @@ try:
         identity = ["--ssl-client-cert", str(root / "client.crt"), "--ssl-client-key", str(root / "client.key")]
         ca = ["--ssl-root-cert", str(root / "ca.crt")]
 
-        def check(label, port, mode, extra=(), host="localhost", success=True, password_file=None):
-            credentials = ["--password", password] if password_file is None else []
-            env = dict(os.environ, PGPASSFILE=str(password_file)) if password_file is not None else None
+        def check(label, port, mode, extra=(), host="localhost", success=True,
+                  password_file=None, env_password=None, explicit_password=None):
+            if explicit_password is not None:
+                credentials = ["--password", explicit_password]
+            elif password_file is None and env_password is None:
+                credentials = ["--password", password]
+            else:
+                credentials = []
+            env = dict(os.environ, PGPASSFILE=str(password_file or root / "absent-passwords"))
+            env.pop("PGPASSWORD", None)
+            if env_password is not None:
+                env["PGPASSWORD"] = env_password
             result = run(binary, "--database", "postgres", "--user", "postgres", *credentials,
                          "--host", host, "--port", port, "--root", str(migrations), "--dry-run",
                          "--sslmode", mode, *extra, ok=False, env=env)
@@ -111,6 +120,18 @@ try:
             check(f"insecure password file {mode:o} is ignored", plain_port, "disable", password_file=pgpass, success=False)
         pgpass.chmod(0o400)
         check("owner-only read permission is sufficient", plain_port, "disable", password_file=pgpass)
+        check("PGPASSWORD preserves literal special characters", plain_port, "disable", env_password=password)
+        check("empty PGPASSWORD falls back to password file", plain_port, "disable", password_file=pgpass, env_password="")
+        check("wrong PGPASSWORD takes precedence over correct file", plain_port, "disable", password_file=pgpass,
+              env_password="wrong", success=False)
+        pgpass.chmod(0o600)
+        pgpass.write_text("*:*:*:*:wrong")
+        check("PGPASSWORD takes precedence over wrong file", plain_port, "disable", password_file=pgpass,
+              env_password=password)
+        check("explicit password overrides environment and file", plain_port, "disable", password_file=pgpass,
+              env_password="wrong", explicit_password=password)
+        check("wrong explicit password does not fall back to environment", plain_port, "disable", env_password=password,
+              explicit_password="wrong", success=False)
         print("All CLI TLS and password-file checks passed.", flush=True)
 finally:
     for name in containers:
