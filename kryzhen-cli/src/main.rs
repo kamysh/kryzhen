@@ -20,7 +20,7 @@ struct Args {
     #[command(flatten)]
     db: DbArgs,
 
-    /// Print the planned migration order; apply nothing.
+    /// Print the planned migration order; apply nothing (default command only).
     #[arg(long, global = true)]
     dry_run: bool,
 
@@ -371,6 +371,15 @@ fn reject_schema_override(db: &DbArgs, subcommand: &str) -> anyhow::Result<()> {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    // Validate before logging, reading migration files, or opening a connection.
+    // Subcommands must never silently ignore a request not to mutate state.
+    if args.dry_run && args.command.is_some() {
+        anyhow::bail!(
+            "--dry-run is supported only for the default migration command; \
+             it cannot be combined with a subcommand"
+        );
+    }
+
     match args.command {
         // ------------------------------------------------------------------ verify
         Some(Cmd::Verify) => {
@@ -468,9 +477,6 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 init_logging(verbose);
                 reject_schema_override(&db, "hack migrate-from sqlx convert")?;
-                if args.dry_run {
-                    anyhow::bail!("--dry-run is not supported for 'hack migrate-from sqlx convert'; omit it to run for real");
-                }
                 let root = require_root(args.root)?;
                 let client = connect(&db).await?;
                 let receipt = sqlx_import::convert(&client, &root)
@@ -487,7 +493,7 @@ async fn main() -> anyhow::Result<()> {
                         receipt.newly_converted,
                         root.join(".kryzhen-import-receipt.json").display(),
                     );
-                    println!("\nNext step: kryzhen hack migrate-from sqlx import");
+                    println!("\nNext step: run `kryzhen hack migrate-from sqlx import` with the same --root and database connection options.");
                 }
             }
 
@@ -500,9 +506,6 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 init_logging(verbose);
                 reject_schema_override(&db, "hack migrate-from sqlx import")?;
-                if args.dry_run {
-                    anyhow::bail!("--dry-run is not supported for 'hack migrate-from sqlx import'; omit it to run for real");
-                }
                 let root = require_root(args.root)?;
                 let receipt_path = root.join(sqlx_import::RECEIPT_FILENAME);
                 let receipt = sqlx_import::read_receipt(&receipt_path).map_err(fmt_sqlx_err)?;
@@ -518,7 +521,7 @@ async fn main() -> anyhow::Result<()> {
                     "Imported {} migration(s) into mallard.applied_migrations. _sqlx_migrations dropped.",
                     receipt.migrations.len()
                 );
-                    println!("\nYou can now use `kryzhen migrate` as normal.");
+                    println!("\nRun `kryzhen` with the same --root and database connection options to apply pending migrations.");
                 }
             }
 
@@ -531,9 +534,6 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 init_logging(verbose);
                 reject_schema_override(&db, "hack migrate-from sqlx all")?;
-                if args.dry_run {
-                    anyhow::bail!("--dry-run is not supported for 'hack migrate-from sqlx all'; omit it to run for real");
-                }
                 let root = require_root(args.root)?;
                 let mut client = connect(&db).await?;
 
@@ -563,7 +563,7 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
 
-                println!("\nDone. You can now use `kryzhen migrate` as normal.");
+                println!("\nDone. Run `kryzhen` with the same --root and database connection options to apply pending migrations.");
             }
         },
     }
