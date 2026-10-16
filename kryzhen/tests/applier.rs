@@ -33,6 +33,85 @@ fn mig(name: &str, body: &str) -> Migration {
 }
 
 #[tokio::test]
+async fn dry_run_on_fresh_database_is_read_only() {
+    let (mut client, _node) = connect().await;
+    client.batch_execute("BEGIN READ ONLY").await.unwrap();
+    let report = migrate(
+        &mut client,
+        &[mig("create_t", "CREATE TABLE t (id int);")],
+        Some("new_tenant"),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.applied, vec!["create_t"]);
+    let count: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_namespace WHERE nspname IN ('mallard', 'new_tenant')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 0);
+    client.batch_execute("ROLLBACK").await.unwrap();
+}
+
+#[tokio::test]
+async fn dry_run_reads_schema_history_and_checksums_without_writes() {
+    let (mut client, _node) = connect().await;
+    let migrations = [mig("create_t", "CREATE TABLE t (id int);")];
+    migrate(&mut client, &migrations, Some("tenant_a"), false)
+        .await
+        .unwrap();
+    client.batch_execute("BEGIN READ ONLY").await.unwrap();
+    let report = migrate(&mut client, &migrations, Some("tenant_a"), true)
+        .await
+        .unwrap();
+    assert!(report.applied.is_empty());
+    assert_eq!(report.already_applied, vec!["create_t"]);
+    let report = migrate(&mut client, &migrations, Some("tenant_b"), true)
+        .await
+        .unwrap();
+    assert_eq!(report.applied, vec!["create_t"]);
+    assert!(report.already_applied.is_empty());
+    let error = migrate(
+        &mut client,
+        &[mig("create_t", "SELECT 42;")],
+        Some("tenant_a"),
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, kryzhen::Error::ChecksumMismatch(_)));
+    client.batch_execute("ROLLBACK").await.unwrap();
+}
+
+#[tokio::test]
+async fn dry_run_reads_legacy_history_without_bootstrapping() {
+    let (mut client, _node) = connect().await;
+    let migrations = [mig("create_t", "CREATE TABLE t (id int);")];
+    migrate(&mut client, &migrations, Some("public"), false)
+        .await
+        .unwrap();
+    client.batch_execute(
+        "DROP TABLE mallard.applied_migration_schemas; DROP TABLE mallard.migrator_version; BEGIN READ ONLY"
+    ).await.unwrap();
+    let report = migrate(&mut client, &migrations, None, true).await.unwrap();
+    assert_eq!(report.already_applied, vec!["create_t"]);
+    assert!(report.applied.is_empty());
+    let report = migrate(&mut client, &migrations, Some("new_tenant"), true)
+        .await
+        .unwrap();
+    assert_eq!(report.applied, vec!["create_t"]);
+    let missing: bool = client.query_one(
+        "SELECT to_regclass('mallard.applied_migration_schemas') IS NULL AND to_regclass('mallard.migrator_version') IS NULL", &[]
+    ).await.unwrap().get(0);
+    assert!(missing);
+    client.batch_execute("ROLLBACK").await.unwrap();
+}
+
+#[tokio::test]
 async fn ensure_schema_is_idempotent() {
     let (mut client, _node) = connect().await;
     ensure_schema(&mut client).await.unwrap();
@@ -198,7 +277,7 @@ async fn applies_mallard_example_contacts_tree() {
 
 #[test]
 fn implicit_dep_does_not_duplicate_explicit_predecessor() {
-    let migs = kryzhen::file::load_dir(&mallard_example_dir().join("tables")).unwrap();
+    let migs = kryzhen::file::load_dir(mallard_example_dir().join("tables")).unwrap();
     let phone_name = migs
         .iter()
         .find(|m| m.name == MigrationName("tables/phone/name".into()))
@@ -212,7 +291,7 @@ fn implicit_dep_does_not_duplicate_explicit_predecessor() {
 
 #[test]
 fn mallard_test_block_is_rejected() {
-    let err = kryzhen::file::load_dir(&mallard_example_dir()).unwrap_err();
+    let err = kryzhen::file::load_dir(mallard_example_dir()).unwrap_err();
     assert!(
         matches!(err, kryzhen::Error::Parse { .. }),
         "a #!test block must be a parse error, got: {err:?}"

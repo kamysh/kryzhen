@@ -273,6 +273,42 @@ pub async fn load_applied(client: &impl GenericClient) -> Result<HashMap<Migrati
     Ok(out)
 }
 
+/// Read a plan without creating or upgrading tracking tables.
+pub(crate) async fn load_plan_state(
+    client: &impl GenericClient,
+    schema: &str,
+) -> Result<(HashMap<MigrationName, [u8; 32]>, HashSet<MigrationName>)> {
+    // Catalog existence checks must not hide a present but unreadable table.
+    // Loading it below should report the permission error, not plan a replay.
+    let row = client
+        .query_one(
+            "SELECT to_regclass('mallard.applied_migrations') IS NOT NULL, \
+             to_regclass('mallard.applied_migration_schemas') IS NOT NULL",
+            &[],
+        )
+        .await?;
+    let canonical_exists: bool = row.get(0);
+    let associations_exist: bool = row.get(1);
+    if !canonical_exists {
+        return Ok((HashMap::new(), HashSet::new()));
+    }
+    let checksums = load_applied(client).await?;
+    let applied = if associations_exist {
+        load_applied_for_schema(client, schema).await?
+    } else {
+        let current: String = client
+            .query_one("SELECT current_schema()", &[])
+            .await?
+            .get(0);
+        if current == schema {
+            checksums.keys().cloned().collect()
+        } else {
+            HashSet::new()
+        }
+    };
+    Ok((checksums, applied))
+}
+
 /// Load the set of migration names already applied to `schema` (the per-schema skip-set).
 pub async fn load_applied_for_schema(
     client: &impl GenericClient,

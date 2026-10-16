@@ -38,7 +38,7 @@
 //! ).await?;
 //! tokio::spawn(async move { let _ = conn.await; });
 //!
-//! let migrations = file::load_dir(std::path::Path::new("migrations"))?;
+//! let migrations = file::load_dir("migrations")?;
 //! // `None` targets the connection's current_schema() (the first entry in its
 //! // search_path — `public` unless configured otherwise). Pass `Some("schema")` to
 //! // target a specific schema, e.g. a different one per customer to template.
@@ -104,7 +104,6 @@ pub struct Report {
     pub already_applied: Vec<String>,
 }
 
-use std::collections::HashMap;
 use tokio_postgres::GenericClient;
 
 /// Run all pending migrations against `schema` on the supplied database connection.
@@ -129,8 +128,9 @@ use tokio_postgres::GenericClient;
 /// applied to `schema` if missing there (schemas may sit at different points in the
 /// chain). Checksum/tamper detection is schema-independent (the body is the same).
 ///
-/// When `dry_run` is `true`, nothing is applied; the function still connects and
-/// verifies checksums.
+/// When `dry_run` is `true`, only reads are issued: tracking tables are neither
+/// created nor upgraded, and no migration or bookkeeping is written. Existing
+/// checksums are still verified. This works in a read-only transaction.
 pub async fn migrate(
     client: &mut impl GenericClient,
     migrations: &[Migration],
@@ -140,7 +140,9 @@ pub async fn migrate(
     validation::check_duplicate_names(migrations)?;
     let ordered = graph::topo_sort(migrations.to_vec())?;
 
-    postgres::ensure_schema(client).await?;
+    if !dry_run {
+        postgres::ensure_schema(client).await?;
+    }
 
     // Resolve the target: an explicit schema, or the connection's current_schema() when
     // unspecified (matching the backfill/import paths, so an unspecified schema always
@@ -153,9 +155,15 @@ pub async fn migrate(
             .get(0),
     };
 
-    let checksums: HashMap<MigrationName, [u8; 32]> = postgres::load_applied(client).await?;
+    let (checksums, applied_here) = if dry_run {
+        postgres::load_plan_state(client, &schema).await?
+    } else {
+        (
+            postgres::load_applied(client).await?,
+            postgres::load_applied_for_schema(client, &schema).await?,
+        )
+    };
     validation::check_checksums(&ordered, &checksums)?;
-    let applied_here = postgres::load_applied_for_schema(client, &schema).await?;
 
     let mut report = Report::default();
     for m in &ordered {

@@ -9,6 +9,39 @@ Available as:
 
 ---
 
+## Installation
+
+Download a prebuilt **2.0.2** CLI (no Rust or Nix installation required):
+
+```sh
+mkdir -p "$HOME/.local/bin"
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64)  ASSET=kryzhen-linux-amd64 ;;
+  Linux-aarch64) ASSET=kryzhen-linux-arm64 ;;
+  Darwin-arm64)  ASSET=kryzhen-darwin-arm64 ;;
+  *) echo "See docs/development.md for a source build" >&2; exit 1 ;;
+esac
+curl -fL "https://github.com/kamysh/kryzhen/releases/download/v2.0.2/${ASSET}" \
+  -o "$HOME/.local/bin/kryzhen"
+chmod +x "$HOME/.local/bin/kryzhen"
+export PATH="$HOME/.local/bin:$PATH"
+kryzhen --version
+```
+
+For a Rust application, add the versioned Git dependency (the crate is not yet
+published on crates.io):
+
+```toml
+[dependencies]
+kryzhen = { git = "https://github.com/kamysh/kryzhen", tag = "v2.0.2" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-postgres = "0.7"
+anyhow = "1"
+```
+
+See [Library usage](#library-usage) for a complete example and
+[Development](docs/development.md) for source-build prerequisites.
+
 ## Migration file format
 
 Migration files are plain `.sql` files. Each file may contain one or more `#!migration` blocks. A block begins with a header comment and is followed by the SQL body:
@@ -87,8 +120,8 @@ Because the body runs with `search_path` set to the target schema only, a migrat
 Apply to a schema with `--schema` (library: the `schema` argument to `migrate`). Omit it to target the connection's `current_schema()` (`public` unless configured otherwise). To roll the same migrations out to several schemas, run once per schema:
 
 ```bash
-kryzhen --database app --schema customer_a migrations/
-kryzhen --database app --schema customer_b migrations/
+kryzhen --database app --schema customer_a --root migrations/
+kryzhen --database app --schema customer_b --root migrations/
 ```
 
 Tracking is **per schema**: the `mallard.applied_migration_schemas` table records which migrations have reached which schema. Different schemas may sit at different points in the chain — onboarding a new customer applies the whole chain into a fresh schema, while adding a new migration only applies the missing tail to each existing schema. The canonical `mallard.applied_migrations` row (body + checksum) is written once, on the first schema to apply a given migration, and tamper detection is verified against it on every run (the body is schema-independent).
@@ -156,20 +189,22 @@ verifies checksums).
 ## CLI usage
 
 ```
-kryzhen --database mydb [ROOT]
+kryzhen --database mydb --root migrations/
 ```
 
-`ROOT` defaults to `.` (current directory).
+`migrations/` is the directory containing your SQL migration files. Supply it
+with `--root` (or `-r`); use `--root .` for the current directory.
 
 ### Flags
 
 | Flag | Default | Description |
 |---|---|---|
+| `--root <DIRECTORY>` | *(required)* | Directory containing migration files. |
 | `--database <DATABASE>` | *(required)* | Database name. |
 | `--host <HOST>` | `127.0.0.1` | Server host. |
 | `--port <PORT>` | `5432` | Server port. |
 | `--user <USER>` | `postgres` | Username. |
-| `--schema <SCHEMA>` | `public` | Target schema for the migrations. See [Multiple schemas](#multiple-schemas-templated-migrations). |
+| `--schema <SCHEMA>` | `current_schema()` | Target schema for the migrations. See [Multiple schemas](#multiple-schemas-templated-migrations). |
 | `--password <PASSWORD>` | *(empty)* | Password. |
 | `--sslmode <MODE>` | `prefer` | TLS mode: `disable`, `prefer`, `require`, `verify-ca`, or `verify-full`. See [TLS](#tls). |
 | `--ssl-root-cert <PATH>` | *(none)* | CA certificate for `verify-ca` / `verify-full` (PEM). |
@@ -183,7 +218,7 @@ kryzhen --database mydb [ROOT]
 ### Example — dry run
 
 ```
-kryzhen --database mydb --dry-run migrations/
+kryzhen --database mydb --dry-run --root migrations/
 ```
 
 Prints the migrations that would be applied, in topological order, without modifying the database. (It still connects, to load the applied set and verify checksums.)
@@ -192,7 +227,8 @@ Prints the migrations that would be applied, in topological order, without modif
 
 ## TLS
 
-kryzhen negotiates TLS using the standard libpq `sslmode` values:
+The CLI supports these `--sslmode` values. Library users supply their own
+configured PostgreSQL connection:
 
 | Mode | Behaviour |
 |---|---|
@@ -202,13 +238,16 @@ kryzhen negotiates TLS using the standard libpq `sslmode` values:
 | `verify-ca` | Require TLS and verify the server certificate against `ssl_root_cert`. |
 | `verify-full` | Like `verify-ca`, and also verify the server hostname matches the certificate CN/SAN. |
 
-In `prefer` and `require` the connection is **encrypted but the server certificate is not verified** — matching libpq's behaviour for those modes. This lets kryzhen connect to a database using a self-signed or private-CA certificate (common for internal PostgreSQL deployments).
+In `prefer` and `require` the connection is **encrypted but the server certificate is not verified**. This lets kryzhen connect to a database using a self-signed or private-CA certificate (common for internal PostgreSQL deployments).
 
-For `verify-ca` and `verify-full`, set `ssl_root_cert` (library) or `--ssl-root-cert` (CLI) to the CA certificate PEM file.
+For `verify-ca` and `verify-full`, set `--ssl-root-cert` to the CA certificate PEM file. Without this option, verification uses the
+system trust store. `verify-ca` checks the chain but not the hostname; use
+`verify-full` to authenticate both. All three required-TLS modes fail if the server
+declines TLS. TLS certificate options with `disable` are rejected.
 
 ### Mutual TLS
 
-To present a client certificate to the server (for PostgreSQL `clientcert=verify-full` authentication), set both `ssl_client_cert` and `ssl_client_key` (library) or `--ssl-client-cert` and `--ssl-client-key` (CLI). Mutual TLS can be combined with any sslmode that establishes a TLS connection (`prefer`, `require`, `verify-ca`, `verify-full`).
+To present a client certificate to the server (for PostgreSQL `clientcert=verify-full` authentication), set both `--ssl-client-cert` and `--ssl-client-key` (PKCS#8 PEM). Mutual TLS can be combined with any sslmode that establishes a TLS connection (`prefer`, `require`, `verify-ca`, `verify-full`).
 
 TLS uses OpenSSL (via `native-tls`), so the build needs OpenSSL and `pkg-config` available — see [docs/development.md](docs/development.md).
 
@@ -221,18 +260,18 @@ The `kryzhen hack` subcommand provides low-level manipulation of `mallard.applie
 ### `hack add` — record a migration as applied without running its SQL
 
 ```bash
-kryzhen hack add <NAME> --root migrations/ --database mydb
+kryzhen hack add <NAME> --root migrations/ --database mydb --schema public
 ```
 
-Records `NAME` as applied (to `--schema`, default `public`) without executing the SQL body. Useful when a migration has already been applied by other means (e.g. provisioned by Terraform, applied by another tool). Fails if any of the migration's `requires` are not yet applied **to that schema**.
+Records `NAME` as applied (to the required `--schema`) without executing the SQL body. Useful when a migration has already been applied by other means (e.g. provisioned by Terraform, applied by another tool). Fails if any of the migration's `requires` are not yet applied **to that schema**.
 
 ### `hack delete` — remove a migration record without running any SQL
 
 ```bash
-kryzhen hack delete <NAME> --database mydb
+kryzhen hack delete <NAME> --database mydb --schema public
 ```
 
-Removes `NAME`'s association with `--schema` (default `public`) from `mallard.applied_migration_schemas`. Fails if any migration applied to that schema lists `NAME` in its `requires`. When that was `NAME`'s last remaining schema, the canonical `mallard.applied_migrations` row is also removed.
+Removes `NAME`'s association with the required `--schema` from `mallard.applied_migration_schemas`. Fails if any migration applied to that schema lists `NAME` in its `requires`. When that was `NAME`'s last remaining schema, the canonical `mallard.applied_migrations` row is also removed.
 
 ### `hack fix-checksum` — update a stored checksum to match the current file
 
@@ -256,10 +295,10 @@ If you have an existing project that uses [sqlx migrations](https://docs.rs/sqlx
 
 ```bash
 # Phase 1: verify checksums, rewrite files with #!migration headers, write receipt
-kryzhen hack migrate-from sqlx convert [MIGRATIONS_DIR] --database mydb
+kryzhen hack migrate-from sqlx convert --root migrations/ --database mydb
 
 # Phase 2: re-verify _sqlx_migrations against the receipt, insert into mallard
-kryzhen hack migrate-from sqlx import [MIGRATIONS_DIR] --database mydb
+kryzhen hack migrate-from sqlx import --root migrations/ --database mydb
 
 # Or run both phases in one command:
 kryzhen hack migrate-from sqlx all [MIGRATIONS_DIR] --database mydb

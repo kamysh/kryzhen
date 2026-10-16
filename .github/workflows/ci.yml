@@ -1,0 +1,25 @@
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v14
+        with:
+          flakehub: false
+      - name: Format, lint, and full test suite
+        run: |
+          nix develop --command bash -euc '
+            cargo fmt --all -- --check
+            cargo clippy --workspace --all-targets --locked -- -D warnings
+            cargo test --workspace --locked -- --test-threads=4
+            cargo build --workspace --locked
+            python3 scripts/test-cli-tls.py
+          '
