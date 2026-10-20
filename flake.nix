@@ -35,6 +35,12 @@
           # The integration tests under kryzhen/tests/applier.rs need Docker, which is
           # not available in the Nix sandbox; run them via `cargo test` in the devShell.
           doCheck = false;
+          meta = {
+            description = "Dependency-based PostgreSQL migrations with per-schema tracking";
+            homepage = "https://github.com/kamysh/kryzhen";
+            license = pkgs.lib.licenses.asl20;
+            mainProgram = "kryzhen";
+          };
         };
 
         kryzhen = pkgs.rustPlatform.buildRustPackage commonAttrs;
