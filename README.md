@@ -1,13 +1,24 @@
-# kryzhen
+# Kryzhen
 
-A Rust port of the Haskell [`mallard`](https://hackage.haskell.org/package/mallard) SQL migration tool ([source](https://github.com/AndrewRademacher/mallard)). Forward-only (accretive — no down-migrations), dependency-resolved migrations for PostgreSQL. Compatible with mallard's on-disk migration file format and its `mallard.applied_migrations` tracking table.
+Dependency-based PostgreSQL migrations, available as a Rust library and a CLI.
 
-Available as:
+Write SQL migrations with named dependencies. Kryzhen orders them, applies each
+migration in its own transaction, and records which migrations have reached each
+target schema. The same migration set can be applied independently to several
+schemas.
 
-- **library crate** `kryzhen` — call `migrate()` programmatically.
-- **CLI binary** `kryzhen` (crate `kryzhen-cli`) — run migrations from the command line.
+- Declare dependencies with `requires` instead of relying on filename order.
+- Apply pending migrations separately for each target schema.
+- Reject dependency cycles, missing dependencies and changes to applied SQL bodies.
+- Use the mallard migration format and tracking table through a Rust implementation.
 
----
+Kryzhen uses forward-only migrations. The checksum covers the trimmed SQL body;
+it is not a signature of the complete migration file or metadata.
+
+See [Installation](#installation) for prebuilt binaries and the versioned Git
+dependency, and [Library usage](#library-usage) for application integration.
+
+**Article:** [Kryzhen PostgreSQL migrations with dependencies and multiple schemas](docs/articles/dependency-based-migrations.md).
 
 ## Installation
 
@@ -360,6 +371,16 @@ See [docs/development.md](docs/development.md) for how to build, test, and contr
 API documentation is available via `cargo doc --open`.
 
 ---
+
+## Related projects
+
+| Project | Purpose |
+| --- | --- |
+| [Muninn](https://github.com/kamysh/muninn) | Code search and repository knowledge for AI coding agents |
+| [Mimir](https://github.com/kamysh/mimir) | Decisions, evidence and reasoning memory across agent sessions |
+
+Muninn and Mimir can run independently. Their documented setup can share one
+compatible PostgreSQL instance with separate roles and databases.
 
 ## License
 
