@@ -22,6 +22,24 @@ dependency, and [Library usage](#library-usage) for application integration.
 
 ## Installation
 
+### With Nix
+
+With Nix installed and its `nix-command` and `flakes` features enabled, build the
+CLI without installing it:
+
+```sh
+nix build github:kamysh/kryzhen#kryzhen
+./result/bin/kryzhen --version
+```
+
+To add it to your user profile instead, use
+`nix profile add github:kamysh/kryzhen#kryzhen`.
+This installs the CLI; it does not create a PostgreSQL server or run migrations.
+The commands follow the repository's default branch. Append a commit to the
+repository address, as in `github:kamysh/kryzhen/COMMIT#kryzhen`, to pin a version.
+
+### Prebuilt binary
+
 Download a prebuilt **2.0.3** CLI (no Rust or Nix installation required):
 
 ```sh
